@@ -84,7 +84,7 @@ def calculate_zigzag(df: pd.DataFrame, deviation_pct: float):
 
     return pivots
 
-# --- 2. High-Frequency Technical Setup (Flexible Confluence Window) ---
+# --- 2. Setup Analysis ---
 def analyze_zigzag_setup(df: pd.DataFrame):
     df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=10).rsi()
     pivots_fast = calculate_zigzag(df, deviation_pct=0.05)
@@ -92,7 +92,6 @@ def analyze_zigzag_setup(df: pd.DataFrame):
 
     closed = df.iloc[-1]
     
-    # ขยายกรอบการชนกันเป็น 3 แท่งล่าสุดสำหรับ Slow ZigZag
     slow_window = pivots_slow[-3:]
     has_slow_bottom = -1 in slow_window
     has_slow_top = 1 in slow_window
@@ -107,14 +106,12 @@ def analyze_zigzag_setup(df: pd.DataFrame):
     upper_wick = closed['High'] - max(closed['Close'], closed['Open'])
     lower_wick = min(closed['Close'], closed['Open']) - closed['Low']
 
-    # 1. เงื่อนไข CALL (ขยายโอกาสเข้าเทรด)
     call_candidate = (
         (has_slow_bottom and has_fast_bottom) and
         (lower_wick / total_range >= 0.20 or closed['Close'] > closed['Open']) and
         (closed['rsi'] <= 45)
     )
 
-    # 2. เงื่อนไข PUT
     put_candidate = (
         (has_slow_top and has_fast_top) and
         (upper_wick / total_range >= 0.20 or closed['Close'] < closed['Open']) and
@@ -127,17 +124,11 @@ def ask_groq_ai_zigzag(pair: str, tf: str, closed_row, setup_type: str):
     if not groq_client:
         return None
     prompt = f"""
-    You are an elite Binary Options Price Action Specialist.
-    Asset: {pair} | Timeframe: {tf}
-    CORE TRIGGER: Dual ZigZag 0.05% & 0.15% Confluence at an extreme exhaustion point with Rejection Wick.
-    Setup Direction: {setup_type} for NEXT 1-Candle Expiry.
-    Candle Snapshot:
-    - Close: {closed_row['Close']:.5f} | Open: {closed_row['Open']:.5f}
-    - RSI(10): {closed_row['rsi']:.2f}
-
-    Is this high-probability for a 1-candle reversal?
-    Respond ONLY in strict JSON:
-    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<short 1-sentence reasoning>"}}
+    Binary Options Price Action Analysis.
+    Asset: {pair} | TF: {tf} | Setup: {setup_type}
+    Snapshot: Close: {closed_row['Close']:.5f}, RSI(10): {closed_row['rsi']:.2f}
+    Respond ONLY in JSON:
+    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<1-sentence reasoning>"}}
     """
     try:
         res = groq_client.chat.completions.create(
@@ -151,7 +142,7 @@ def ask_groq_ai_zigzag(pair: str, tf: str, closed_row, setup_type: str):
         print(f"Groq API error: {e}")
         return None
 
-# --- 3. Backtest Engine ---
+# --- 3. Detailed Backtest Engine (Trade-by-Trade History) ---
 def execute_backtest(pair: str, tf: str, days: int):
     ticker = ALL_PAIRS.get(pair)
     if not ticker:
@@ -169,7 +160,13 @@ def execute_backtest(pair: str, tf: str, days: int):
     pivots_slow = calculate_zigzag(df, deviation_pct=0.15)
 
     wins, losses, draws = 0, 0, 0
+    trade_logs = []
+    current_win_streak = 0
+    max_win_streak = 0
+    current_loss_streak = 0
+    max_loss_streak = 0
 
+    trade_count = 0
     for i in range(20, len(df) - 1):
         slow_win = pivots_slow[i-2 : i+1]
         has_slow_b = -1 in slow_win
@@ -203,8 +200,10 @@ def execute_backtest(pair: str, tf: str, days: int):
         signal = "CALL" if call_cond else ("PUT" if put_cond else None)
 
         if signal:
+            trade_count += 1
             entry_p = float(closed['Close'])
             expiry_p = float(next_candle['Close'])
+            entry_time = df.index[i].strftime('%Y-%m-%d %H:%M')
 
             if signal == "CALL":
                 res = "WIN" if expiry_p > entry_p else ("LOSS" if expiry_p < entry_p else "DRAW")
@@ -213,10 +212,29 @@ def execute_backtest(pair: str, tf: str, days: int):
 
             if res == "WIN":
                 wins += 1
+                current_win_streak += 1
+                current_loss_streak = 0
+                if current_win_streak > max_win_streak:
+                    max_win_streak = current_win_streak
             elif res == "LOSS":
                 losses += 1
+                current_loss_streak += 1
+                current_win_streak = 0
+                if current_loss_streak > max_loss_streak:
+                    max_loss_streak = current_loss_streak
             else:
                 draws += 1
+                current_win_streak = 0
+                current_loss_streak = 0
+
+            trade_logs.append({
+                "no": trade_count,
+                "time": entry_time,
+                "direction": signal,
+                "entry_price": entry_p,
+                "expiry_price": expiry_p,
+                "result": res
+            })
 
     total = wins + losses + draws
     winrate = round((wins / (wins + losses) * 100), 2) if (wins + losses) > 0 else 0.0
@@ -229,7 +247,10 @@ def execute_backtest(pair: str, tf: str, days: int):
         "wins": wins,
         "losses": losses,
         "draws": draws,
-        "winrate": winrate
+        "winrate": winrate,
+        "max_win_streak": max_win_streak,
+        "max_loss_streak": max_loss_streak,
+        "trade_logs": trade_logs
     }
 
 # --- 4. Web Dashboard UI ---
@@ -279,7 +300,7 @@ def render_dashboard():
         <title>Binary AI Control Center</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }}
-            .container {{ max-width: 1000px; margin: auto; }}
+            .container {{ max-width: 1100px; margin: auto; }}
             .card {{ background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; }}
             .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }}
             .stat-box {{ background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #334155; text-align: center; }}
@@ -293,7 +314,7 @@ def render_dashboard():
     </head>
     <body>
         <div class="container">
-            <h2>⚡ Binary AI Pro: High-Frequency ZigZag Engine</h2>
+            <h2>⚡ Binary AI Pro: Control & Backtest Engine</h2>
             
             <div class="stats-grid">
                 <div class="stat-box">
@@ -314,8 +335,9 @@ def render_dashboard():
                 </div>
             </div>
 
+            <!-- กล่องทดสอบ Backtest -->
             <div class="card" style="border: 1px solid #3b82f6;">
-                <h3>🧪 ทดสอบย้อนหลัง ZigZag Confluence (Backtest)</h3>
+                <h3>🧪 ทดสอบย้อนหลังพร้อมดู Pattern แพ้-ชนะ (Backtest Simulator)</h3>
                 <form action="/run-backtest" method="post" style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
                     <div>
                         <label>เลือกคู่เงิน:</label>
@@ -342,6 +364,7 @@ def render_dashboard():
                 </form>
             </div>
 
+            <!-- กล่องตั้งค่า Watchlist -->
             <div class="card">
                 <h3>🎯 ตั้งค่าโฟกัสคู่เงิน (บันทึกลง Database อัตโนมัติ)</h3>
                 <form action="/update-watchlist" method="post">
@@ -352,6 +375,7 @@ def render_dashboard():
                 </form>
             </div>
 
+            <!-- กล่องตารางสถิติ Real-time -->
             <div class="card">
                 <h3>📊 สถิติการรันจริง (Live Signals)</h3>
                 <table>
@@ -376,6 +400,7 @@ def render_dashboard():
     """
     return HTMLResponse(content=html_content)
 
+# --- 5. Backtest Result View (With Table & Pattern Badges) ---
 @app.post("/run-backtest")
 def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form(...)):
     res = execute_backtest(pair, tf, days)
@@ -388,28 +413,108 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
         """)
     
     wr_color = "#4ade80" if res['winrate'] >= 60 else "#f87171"
+
+    # สร้างแถบ Visual Pattern Badge
+    pattern_badges = ""
+    for log in res["trade_logs"]:
+        if log["result"] == "WIN":
+            pattern_badges += f'<span style="background:#15803d; color:#fff; padding:3px 7px; border-radius:4px; font-size:12px; font-weight:bold; margin:2px;" title="ไม้ที่ {log["no"]}: WIN">W</span>'
+        elif log["result"] == "LOSS":
+            pattern_badges += f'<span style="background:#b91c1c; color:#fff; padding:3px 7px; border-radius:4px; font-size:12px; font-weight:bold; margin:2px;" title="ไม้ที่ {log["no"]}: LOSS">L</span>'
+        else:
+            pattern_badges += f'<span style="background:#64748b; color:#fff; padding:3px 7px; border-radius:4px; font-size:12px; font-weight:bold; margin:2px;" title="ไม้ที่ {log["no"]}: DRAW">D</span>'
+
+    # สร้างตารางแจกแจงทุกไม้
+    trade_rows = ""
+    for log in reversed(res["trade_logs"]):  # แสดงไม้ล่าสุดขึ้นก่อน
+        res_color = "#4ade80" if log["result"] == "WIN" else ("#f87171" if log["result"] == "LOSS" else "#94a3b8")
+        dir_color = "#38bdf8" if log["direction"] == "CALL" else "#f472b6"
+        trade_rows += f"""
+        <tr>
+            <td style="padding: 8px 12px; border-bottom: 1px solid #334155;">#{log['no']}</td>
+            <td style="padding: 8px 12px; border-bottom: 1px solid #334155; color: #94a3b8;">{log['time']}</td>
+            <td style="padding: 8px 12px; border-bottom: 1px solid #334155; font-weight: bold; color: {dir_color};">{log['direction']}</td>
+            <td style="padding: 8px 12px; border-bottom: 1px solid #334155;">{log['entry_price']:.5f}</td>
+            <td style="padding: 8px 12px; border-bottom: 1px solid #334155;">{log['expiry_price']:.5f}</td>
+            <td style="padding: 8px 12px; border-bottom: 1px solid #334155; font-weight: bold; color: {res_color};">{log['result']}</td>
+        </tr>
+        """
+
     result_html = f"""
     <!DOCTYPE html>
-    <html>
+    <html lang="th">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>ผลทดสอบ Backtest {res['pair']}</title>
         <style>
-            body {{ font-family: sans-serif; background: #0f172a; color: white; padding: 40px; }}
-            .box {{ background: #1e293b; max-width: 600px; margin: auto; padding: 30px; border-radius: 12px; border: 1px solid #334155; }}
-            .stat {{ font-size: 36px; font-weight: bold; color: {wr_color}; margin: 15px 0; }}
-            .btn {{ display: inline-block; background: #3b82f6; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; margin-top: 20px; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: white; padding: 20px; }}
+            .container {{ max-width: 1000px; margin: auto; }}
+            .card {{ background: #1e293b; border-radius: 12px; padding: 25px; margin-bottom: 20px; border: 1px solid #334155; }}
+            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin: 15px 0; }}
+            .stat-box {{ background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #334155; text-align: center; }}
+            .btn {{ display: inline-block; background: #3b82f6; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: bold; }}
+            table {{ width: 100%; border-collapse: collapse; text-align: left; margin-top: 15px; }}
+            th {{ background: #0f172a; padding: 10px 12px; border-bottom: 2px solid #334155; color: #94a3b8; }}
         </style>
     </head>
     <body>
-        <div class="box">
-            <h2>📈 ผลการทดสอบ Backtest: {res['pair']} ({res['timeframe']})</h2>
-            <p style="color: #94a3b8;">กลยุทธ์: <b>High-Frequency ZigZag Confluence</b> (ย้อนหลัง {res['days']} วัน)</p>
-            <div class="stat">Win Rate: {res['winrate']}%</div>
-            <p>• สัญญาณทั้งหมดที่เข้าเกณฑ์: <b>{res['total']}</b> ไม้</p>
-            <p>• ชนะ (WIN): <b style="color: #4ade80;">{res['wins']}</b> ไม้</p>
-            <p>• แพ้ (LOSS): <b style="color: #f87171;">{res['losses']}</b> ไม้</p>
-            <p>• เสมอ (DRAW): <b>{res['draws']}</b> ไม้</p>
-            <a href="/" class="btn">⬅️ กลับหน้าหลัก Dashboard</a>
+        <div class="container">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <h2>📈 ผลการทดสอบ Backtest: {res['pair']} ({res['timeframe']})</h2>
+                <a href="/" class="btn">⬅️ กลับหน้าหลัก Dashboard</a>
+            </div>
+
+            <div class="card">
+                <div class="grid">
+                    <div class="stat-box">
+                        <div style="color: #94a3b8; font-size: 13px;">Win Rate รวม</div>
+                        <div style="font-size: 30px; font-weight: bold; color: {wr_color};">{res['winrate']}%</div>
+                    </div>
+                    <div class="stat-box">
+                        <div style="color: #94a3b8; font-size: 13px;">เข้าเงื่อนไขทั้งหมด</div>
+                        <div style="font-size: 26px; font-weight: bold;">{res['total']} ไม้</div>
+                    </div>
+                    <div class="stat-box">
+                        <div style="color: #94a3b8; font-size: 13px;">ชนะ (WIN) / แพ้ (LOSS)</div>
+                        <div style="font-size: 22px; font-weight: bold;"><span style="color:#4ade80;">{res['wins']}</span> / <span style="color:#f87171;">{res['losses']}</span></div>
+                    </div>
+                    <div class="stat-box">
+                        <div style="color: #94a3b8; font-size: 13px;">ชนะติดกันสูงสุด (Streak)</div>
+                        <div style="font-size: 24px; font-weight: bold; color: #4ade80;">🔥 {res['max_win_streak']} ไม้</div>
+                    </div>
+                    <div class="stat-box">
+                        <div style="color: #94a3b8; font-size: 13px;">แพ้ติดกันสูงสุด (Max DD)</div>
+                        <div style="font-size: 24px; font-weight: bold; color: #f87171;">⚠️ {res['max_loss_streak']} ไม้</div>
+                    </div>
+                </div>
+
+                <h4 style="margin: 20px 0 10px 0; color: #94a3b8;">🧩 ผัง Pattern ผลลัพธ์ตามลำดับเวลา (เรียงจากอดีต -> ปัจจุบัน):</h4>
+                <div style="background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #334155; line-height: 2.2; word-wrap: break-word;">
+                    {pattern_badges}
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>📋 ตารางแจกแจงประวัติทุกไม้แบบละเอียด (เรียงจากไม้ล่าสุดลงไป)</h3>
+                <div style="max-height: 500px; overflow-y: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ไม้ที่</th>
+                                <th>วัน-เวลาที่เข้า</th>
+                                <th>คำสั่ง</th>
+                                <th>ราคาเปิดแท่ง</th>
+                                <th>ราคาปิดแท่ง</th>
+                                <th>ผลลัพธ์</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {trade_rows}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     </body>
     </html>
@@ -424,7 +529,7 @@ def update_watchlist(pairs: list[str] = Form(default=[])):
     send_telegram(f"⚙️ *มีการบันทึก Watchlist ใหม่ลง Database:*\n`{', '.join(active_pairs)}`")
     return HTMLResponse(content="""<script>alert("บันทึกสำเร็จ!"); window.location.href = "/";</script>""")
 
-# --- 5. Telegram & Timing Helpers ---
+# --- 6. Telegram & Timing Helpers ---
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -454,10 +559,10 @@ def sleep_until_next_5m_candle():
         sleep_seconds += 300
     return sleep_seconds
 
-# --- 6. Threads ---
+# --- 7. Threads ---
 def synchronized_trading_loop():
     time.sleep(5)
-    send_telegram("🚀 *ระบบ Binary ZigZag High-Frequency AI เริ่มทำงานแล้ว (24/7)*")
+    send_telegram("🚀 *ระบบ Binary ZigZag Confluence Engine เริ่มทำงานแล้ว (24/7)*")
     
     while True:
         try:
@@ -502,7 +607,7 @@ def synchronized_trading_loop():
                             msg = (
                                 f"{icon} *สัญญาณเข้าเทรดแท่งใหม่ ({setup})*\n"
                                 f"━━━━━━━━━━━━━━━\n"
-                                f"📐 **ตัวบ่งชี้:** `High-Frequency ZigZag Confluence`\n"
+                                f"📐 **ตัวบ่งชี้:** `ZigZag Confluence Engine`\n"
                                 f"📊 **คู่เงิน:** `{name}`\n"
                                 f"⏱ **Timeframe:** `{tf}`\n"
                                 f"🏁 **หมดเวลาที่:** `{expiry_time} UTC`\n"
@@ -624,7 +729,7 @@ def telegram_polling_loop():
 
                     elif text in ["/help", "/start"]:
                         msg_help = (
-                            f"📌 *บอท ZigZag High-Frequency พร้อมทำงาน!*\nChat ID: `{sender_chat_id}`\n\n"
+                            f"📌 *บอท ZigZag Confluence พร้อมทำงาน!*\nChat ID: `{sender_chat_id}`\n\n"
                             f"• `/focus EUR/USD` - เลือกคู่เงิน\n"
                             f"• `/focus all` - เฝ้าทุกคู่\n"
                             f"• `/watchlist` - ดูคู่เงินที่กำลังเฝ้า\n"
@@ -636,7 +741,7 @@ def telegram_polling_loop():
         except Exception as e:
             time.sleep(5)
 
-# --- 7. Start Background Threads ---
+# --- 8. Start Background Threads ---
 threading.Thread(target=synchronized_trading_loop, daemon=True).start()
 threading.Thread(target=outcome_checker_loop, daemon=True).start()
 threading.Thread(target=telegram_polling_loop, daemon=True).start()
