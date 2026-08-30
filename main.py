@@ -36,52 +36,149 @@ TIMEFRAMES = ["5m", "15m"]
 
 app = FastAPI()
 
-# --- 1. ฟังก์ชันคำนวณ Backtest ย้อนหลัง ---
+# --- 1. Economic News Filter (Forex Factory Free Feed) ---
+high_impact_news = []
+last_news_fetch = None
+
+def fetch_economic_calendar():
+    global high_impact_news, last_news_fetch
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if last_news_fetch and (now - last_news_fetch).total_seconds() < 3600:
+        return
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        res = requests.get(url, timeout=10).json()
+        high_impact = []
+        for item in res:
+            if item.get("impact") == "High":
+                news_time = datetime.datetime.fromisoformat(item["date"].replace("Z", "+00:00"))
+                high_impact.append({
+                    "title": item.get("title"),
+                    "currency": item.get("country"),
+                    "time": news_time
+                })
+        high_impact_news = high_impact
+        last_news_fetch = now
+    except Exception as e:
+        print(f"News fetch error: {e}")
+
+def is_near_news(pair: str) -> tuple[bool, str]:
+    fetch_economic_calendar()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    currencies = pair.replace("/", " ").split()
+    for event in high_impact_news:
+        if event["currency"] in currencies:
+            time_diff = (event["time"] - now).total_seconds() / 60.0
+            if -15 <= time_diff <= 15:
+                return True, f"⚠️ ข่าว High Impact: {event['title']} ({event['currency']})"
+    return False, ""
+
+# --- 2. High-Frequency Technical Setup (10-30 ไม้/วัน) ---
+def analyze_advanced_technical(df: pd.DataFrame):
+    df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=7).rsi()
+    bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
+    df['bb_upper'] = bb.bollinger_hband()
+    df['bb_lower'] = bb.bollinger_lband()
+    df['ema_20'] = ta.trend.EMAIndicator(df['Close'], window=20).ema_indicator()
+    
+    closed = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    body_size = abs(closed['Close'] - closed['Open'])
+    upper_wick = closed['High'] - max(closed['Close'], closed['Open'])
+    lower_wick = min(closed['Close'], closed['Open']) - closed['Low']
+    
+    # 1. เงื่อนไข CALL (Mean-Reversion ไว)
+    call_candidate = (
+        (closed['Low'] <= closed['bb_lower'] or prev['Low'] <= prev['bb_lower']) and
+        (closed['Close'] > closed['bb_lower']) and
+        (closed['rsi'] <= 28) and
+        (lower_wick >= body_size * 0.4 or closed['Close'] > closed['Open'])
+    )
+    
+    # 2. เงื่อนไข PUT
+    put_candidate = (
+        (closed['High'] >= closed['bb_upper'] or prev['High'] >= prev['bb_upper']) and
+        (closed['Close'] < closed['bb_upper']) and
+        (closed['rsi'] >= 72) and
+        (upper_wick >= body_size * 0.4 or closed['Close'] < closed['Open'])
+    )
+    
+    recent_window = df.iloc[-30:-1]
+    support_level = float(recent_window['Low'].min())
+    resistance_level = float(recent_window['High'].max())
+    
+    return closed, call_candidate, put_candidate, support_level, resistance_level
+
+def ask_groq_ai_advanced(pair: str, tf: str, closed_row, setup_type: str, support: float, resistance: float):
+    if not groq_client:
+        return None
+    prompt = f"""
+    Binary Options 1-Candle Reversal Scanner.
+    Asset: {pair} | TF: {tf} | Setup: {setup_type}
+    Data:
+    - Close: {closed_row['Close']:.5f}
+    - Fast RSI(7): {closed_row['rsi']:.2f}
+    - BB Upper: {closed_row['bb_upper']:.5f} | BB Lower: {closed_row['bb_lower']:.5f}
+    - EMA 20: {closed_row['ema_20']:.5f}
+
+    Is this mean-reversion setup valid for an immediate 1-candle expiry?
+    Respond ONLY in strict JSON format:
+    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<short 1-sentence reasoning>"}}
+    """
+    try:
+        res = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"}
+        )
+        import json
+        return json.loads(res.choices[0].message.content)
+    except Exception as e:
+        print(f"Groq API error: {e}")
+        return None
+
+# --- 3. Backtest Engine สำหรับหน้าเว็บ ---
 def execute_backtest(pair: str, tf: str, days: int):
     ticker = ALL_PAIRS.get(pair)
     if not ticker:
         return {"error": "ไม่พบคู่เงินนี้"}
     
-    # ดึงข้อมูลย้อนหลังตามจำนวนวันที่เลือก
     df = yf.download(ticker, period=f"{days}d", interval=tf, progress=False)
-    if df.empty or len(df) < 205:
+    if df.empty or len(df) < 50:
         return {"error": f"ข้อมูลย้อนหลังมีไม่เพียงพอ (ได้มา {len(df)} แท่งเทียน)"}
     
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # คำนวณ Indicators
-    df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=14).rsi()
+    df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=7).rsi()
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
     df['bb_upper'] = bb.bollinger_hband()
     df['bb_lower'] = bb.bollinger_lband()
-    df['ema_200'] = ta.trend.EMAIndicator(df['Close'], window=200).ema_indicator()
-    df['adx'] = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'], window=14).adx()
 
     wins, losses, draws = 0, 0, 0
 
-    # จำลองการเทรดแบบ 1-Candle Expiry
-    for i in range(200, len(df) - 1):
+    for i in range(30, len(df) - 1):
         prev = df.iloc[i - 1]
         closed = df.iloc[i]
         next_candle = df.iloc[i + 1]
 
-        is_ranging = closed['adx'] < 32
-        
+        body_size = abs(closed['Close'] - closed['Open'])
+        upper_wick = closed['High'] - max(closed['Close'], closed['Open'])
+        lower_wick = min(closed['Close'], closed['Open']) - closed['Low']
+
         call_cond = (
-            is_ranging and
-            (closed['Close'] > closed['ema_200']) and
-            (prev['Close'] <= prev['bb_lower']) and
+            (closed['Low'] <= closed['bb_lower'] or prev['Low'] <= prev['bb_lower']) and
             (closed['Close'] > closed['bb_lower']) and
-            (closed['rsi'] < 40)
+            (closed['rsi'] <= 28) and
+            (lower_wick >= body_size * 0.4 or closed['Close'] > closed['Open'])
         )
         
         put_cond = (
-            is_ranging and
-            (closed['Close'] < closed['ema_200']) and
-            (prev['Close'] >= prev['bb_upper']) and
+            (closed['High'] >= closed['bb_upper'] or prev['High'] >= prev['bb_upper']) and
             (closed['Close'] < closed['bb_upper']) and
-            (closed['rsi'] > 60)
+            (closed['rsi'] >= 72) and
+            (upper_wick >= body_size * 0.4 or closed['Close'] < closed['Open'])
         )
 
         signal = "CALL" if call_cond else ("PUT" if put_cond else None)
@@ -116,9 +213,9 @@ def execute_backtest(pair: str, tf: str, days: int):
         "winrate": winrate
     }
 
-# --- 2. หน้า Web Dashboard UI (พร้อมระบบ Backtest) ---
+# --- 4. Web Dashboard UI ---
 @app.get("/", response_class=HTMLResponse)
-def render_dashboard(backtest_result: str = None):
+def render_dashboard():
     stats = db.fetch_winrate()
     saved_list = db.get_saved_watchlist(list(ALL_PAIRS.keys()))
     
@@ -127,7 +224,6 @@ def render_dashboard(backtest_result: str = None):
     total_losses = sum(row.get('losses', 0) for row in stats)
     overall_wr = round((total_wins / (total_wins + total_losses) * 100), 2) if (total_wins + total_losses) > 0 else 0.0
 
-    # คู่เงินสำหรับ Watchlist
     pair_checkboxes = ""
     for p in ALL_PAIRS.keys():
         checked = "checked" if p in saved_list else ""
@@ -137,10 +233,8 @@ def render_dashboard(backtest_result: str = None):
         </label>
         """
 
-    # ตัวเลือกคู่เงินสำหรับ Backtest
     pair_options = "".join([f"<option value='{p}'>{p}</option>" for p in ALL_PAIRS.keys()])
 
-    # ตารางสถิติ Real-time
     stats_rows = ""
     for row in stats:
         wr = row.get('win_rate_percentage') or 0
@@ -173,7 +267,7 @@ def render_dashboard(backtest_result: str = None):
             .btn {{ background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
             .btn-green {{ background: #10b981; }}
             .btn:hover {{ opacity: 0.9; }}
-            select, input {{ background: #0f172a; border: 1px solid #334155; color: white; padding: 8px 12px; border-radius: 6px; }}
+            select {{ background: #0f172a; border: 1px solid #334155; color: white; padding: 8px 12px; border-radius: 6px; }}
             table {{ width: 100%; border-collapse: collapse; text-align: left; }}
             th {{ background: #0f172a; padding: 12px; border-bottom: 2px solid #334155; color: #94a3b8; }}
         </style>
@@ -201,7 +295,6 @@ def render_dashboard(backtest_result: str = None):
                 </div>
             </div>
 
-            <!-- กล่องทดสอบย้อนหลัง Backtest -->
             <div class="card" style="border: 1px solid #3b82f6;">
                 <h3>🧪 ทดสอบย้อนหลัง (Backtest Historical Data)</h3>
                 <form action="/run-backtest" method="post" style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
@@ -228,10 +321,8 @@ def render_dashboard(backtest_result: str = None):
                         <button type="submit" class="btn btn-green">🚀 เริ่มจำลอง Backtest ทันที</button>
                     </div>
                 </form>
-                <div id="bt-result" style="margin-top: 15px;"></div>
             </div>
 
-            <!-- กล่องตั้งค่า Watchlist -->
             <div class="card">
                 <h3>🎯 ตั้งค่าโฟกัสคู่เงิน (บันทึกลง Database อัตโนมัติ)</h3>
                 <form action="/update-watchlist" method="post">
@@ -242,7 +333,6 @@ def render_dashboard(backtest_result: str = None):
                 </form>
             </div>
 
-            <!-- กล่องตารางสถิติ Real-time -->
             <div class="card">
                 <h3>📊 สถิติการรันจริง (Live Signals)</h3>
                 <table>
@@ -267,7 +357,6 @@ def render_dashboard(backtest_result: str = None):
     """
     return HTMLResponse(content=html_content)
 
-# --- Endpoint รัน Backtest และคืนผลลัพธ์กลับมาแสดงผล ---
 @app.post("/run-backtest")
 def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form(...)):
     res = execute_backtest(pair, tf, days)
@@ -301,7 +390,7 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
             <p>• ชนะ (WIN): <b style="color: #4ade80;">{res['wins']}</b> ไม้</p>
             <p>• แพ้ (LOSS): <b style="color: #f87171;">{res['losses']}</b> ไม้</p>
             <p>• เสมอ (DRAW): <b>{res['draws']}</b> ไม้</p>
-            <a href="/" class="btn">⬅️ กลับหน้าหลัก</a>
+            <a href="/" class="btn">⬅️ กลับหน้าหลัก Dashboard</a>
         </div>
     </body>
     </html>
@@ -316,103 +405,7 @@ def update_watchlist(pairs: list[str] = Form(default=[])):
     send_telegram(f"⚙️ *มีการบันทึก Watchlist ใหม่ลง Database:*\n`{', '.join(active_pairs)}`")
     return HTMLResponse(content="""<script>alert("บันทึกสำเร็จ!"); window.location.href = "/";</script>""")
 
-# --- ส่วนอื่นๆ (Helper, Scanner, Loops) ---
-high_impact_news = []
-last_news_fetch = None
-
-def fetch_economic_calendar():
-    global high_impact_news, last_news_fetch
-    now = datetime.datetime.now(datetime.timezone.utc)
-    if last_news_fetch and (now - last_news_fetch).total_seconds() < 3600:
-        return
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        res = requests.get(url, timeout=10).json()
-        high_impact = []
-        for item in res:
-            if item.get("impact") == "High":
-                news_time = datetime.datetime.fromisoformat(item["date"].replace("Z", "+00:00"))
-                high_impact.append({
-                    "title": item.get("title"),
-                    "currency": item.get("country"),
-                    "time": news_time
-                })
-        high_impact_news = high_impact
-        last_news_fetch = now
-    except Exception as e:
-        print(f"News fetch error: {e}")
-
-def is_near_news(pair: str) -> tuple[bool, str]:
-    fetch_economic_calendar()
-    now = datetime.datetime.now(datetime.timezone.utc)
-    currencies = pair.replace("/", " ").split()
-    for event in high_impact_news:
-        if event["currency"] in currencies:
-            time_diff = (event["time"] - now).total_seconds() / 60.0
-            if -15 <= time_diff <= 15:
-                return True, f"⚠️ ใกล้ช่วงข่าว: {event['title']} ({event['currency']})"
-    return False, ""
-
-def analyze_advanced_technical(df: pd.DataFrame):
-    df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=14).rsi()
-    bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
-    df['bb_upper'] = bb.bollinger_hband()
-    df['bb_lower'] = bb.bollinger_lband()
-    df['ema_50'] = ta.trend.EMAIndicator(df['Close'], window=50).ema_indicator()
-    df['ema_200'] = ta.trend.EMAIndicator(df['Close'], window=200).ema_indicator()
-    df['adx'] = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'], window=14).adx()
-    
-    closed = df.iloc[-1]
-    prev = df.iloc[-2]
-    recent_window = df.iloc[-60:-1]
-    support_level = float(recent_window['Low'].min())
-    resistance_level = float(recent_window['High'].max())
-    
-    is_ranging = closed['adx'] < 32
-    call_candidate = (
-        is_ranging and
-        (closed['Close'] > closed['ema_200']) and
-        (prev['Close'] <= prev['bb_lower']) and
-        (closed['Close'] > closed['bb_lower']) and
-        (closed['rsi'] < 40)
-    )
-    put_candidate = (
-        is_ranging and
-        (closed['Close'] < closed['ema_200']) and
-        (prev['Close'] >= prev['bb_upper']) and
-        (closed['Close'] < closed['bb_upper']) and
-        (closed['rsi'] > 60)
-    )
-    return closed, call_candidate, put_candidate, support_level, resistance_level
-
-def ask_groq_ai_advanced(pair: str, tf: str, closed_row, setup_type: str, support: float, resistance: float):
-    if not groq_client:
-        return None
-    prompt = f"""
-    You are an elite Binary Options Price Action Specialist analyzing a 1-Candle Reversal.
-    Asset: {pair} | Timeframe: {tf} | Signal Setup: Potential {setup_type}
-    Closed Candle Data:
-    - Close: {closed_row['Close']:.5f}
-    - RSI(14): {closed_row['rsi']:.2f}
-    - ADX(14): {closed_row['adx']:.2f}
-    - EMA 50: {closed_row['ema_50']:.5f} | EMA 200: {closed_row['ema_200']:.5f}
-    - Key Support: {support:.5f} | Key Resistance: {resistance:.5f}
-
-    Respond ONLY in strict JSON:
-    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<1-sentence reason>"}}
-    """
-    try:
-        res = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-            response_format={"type": "json_object"}
-        )
-        import json
-        return json.loads(res.choices[0].message.content)
-    except Exception as e:
-        print(f"Groq API error: {e}")
-        return None
-
+# --- 5. Telegram & Helper Functions ---
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -442,11 +435,11 @@ def sleep_until_next_5m_candle():
         sleep_seconds += 300
     return sleep_seconds
 
-# --- Threads ---
+# --- 6. Threads ---
 def synchronized_trading_loop():
     time.sleep(5)
     fetch_economic_calendar()
-    send_telegram("🚀 *ระบบ Binary AI Pro (News Shield + Backtest Enabled) เริ่มทำงานแล้ว (24/7)*")
+    send_telegram("🚀 *ระบบ Binary AI Pro (High-Frequency 10-30 ไม้/วัน) เริ่มทำงานแล้ว (24/7)*")
     
     while True:
         try:
@@ -471,7 +464,7 @@ def synchronized_trading_loop():
                 ticker = ALL_PAIRS[name]
                 for tf in timeframes_to_check:
                     df = yf.download(ticker, period="5d", interval=tf, progress=False)
-                    if df.empty or len(df) < 205:
+                    if df.empty or len(df) < 50:
                         continue
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
@@ -481,7 +474,7 @@ def synchronized_trading_loop():
                     
                     if setup:
                         ai_res = ask_groq_ai_advanced(name, tf, closed_candle, setup, support, resistance)
-                        if ai_res and ai_res.get("confidence", 0) >= 80:
+                        if ai_res and ai_res.get("confidence", 0) >= 70:
                             entry_price = float(closed_candle['Close'])
                             conf = float(ai_res['confidence'])
                             reason = ai_res.get('reason', '')
@@ -496,7 +489,7 @@ def synchronized_trading_loop():
                                 f"{icon} *สัญญาณเข้าเทรดแท่งใหม่ ({setup})*\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"📊 **คู่เงิน:** `{name}`\n"
-                                f"⏱ **Timeframe:** `{tf}`\n"
+                                f"⏱ **Timeframe:** `{tf}` (เข้าแท่งนี้ทันที)\n"
                                 f"🏁 **หมดเวลาที่:** `{expiry_time} UTC`\n"
                                 f"💵 **ราคาเปิดแท่ง:** `{entry_price:.5f}`\n"
                                 f"🎯 **ความมั่นใจ:** `{conf}%`\n"
@@ -585,14 +578,14 @@ def telegram_polling_loop():
                         if len(parts) < 2 or parts[1].strip().lower() == "all":
                             active_pairs = list(ALL_PAIRS.keys())
                             db.update_saved_watchlist(active_pairs)
-                            send_telegram_direct(sender_chat_id, "✅ *ตั้งค่าโฟกัส:* เฝ้าดู **ทุกคู่เงิน**")
+                            send_telegram_direct(sender_chat_id, "✅ *ตั้งค่าโฟกัส:* เฝ้าดู **ทุกคู่เงิน** (บันทึกลง Database แล้ว)")
                         else:
                             selected = [p.strip().upper() for p in parts[1].split(",") if p.strip().upper() in ALL_PAIRS]
                             if selected:
                                 active_pairs = selected
                                 db.update_saved_watchlist(active_pairs)
                                 pairs_text = ", ".join(active_pairs)
-                                send_telegram_direct(sender_chat_id, f"🎯 *ตั้งค่าโฟกัสสำเร็จ!*\nกำลังเฝ้าเฉพาะ: `{pairs_text}`")
+                                send_telegram_direct(sender_chat_id, f"🎯 *ตั้งค่าโฟกัสสำเร็จ!*\nกำลังเฝ้าเฉพาะ: `{pairs_text}` (บันทึกลง Database แล้ว)")
                             else:
                                 send_telegram_direct(sender_chat_id, "⚠️ ไม่พบคู่เงินที่ระบุ กรุณาพิมพ์เช่น `/focus EUR/USD,GBP/USD`")
 
@@ -628,7 +621,7 @@ def telegram_polling_loop():
         except Exception as e:
             time.sleep(5)
 
-# --- Start Background Threads ---
+# --- 7. Start Services ---
 threading.Thread(target=synchronized_trading_loop, daemon=True).start()
 threading.Thread(target=outcome_checker_loop, daemon=True).start()
 threading.Thread(target=telegram_polling_loop, daemon=True).start()
