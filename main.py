@@ -37,7 +37,7 @@ TIMEFRAMES = ["5m", "15m"]
 
 app = FastAPI()
 
-# --- 1. ZigZag 0.05% & 0.15% Algorithm ---
+# --- 1. ZigZag Calculation Engine ---
 def calculate_zigzag(df: pd.DataFrame, deviation_pct: float):
     threshold = deviation_pct / 100.0
     pivots = np.zeros(len(df))
@@ -84,38 +84,41 @@ def calculate_zigzag(df: pd.DataFrame, deviation_pct: float):
 
     return pivots
 
-# --- 2. Advanced Setup with Rejection Wick & Momentum Filter ---
+# --- 2. High-Frequency Technical Setup (Flexible Confluence Window) ---
 def analyze_zigzag_setup(df: pd.DataFrame):
     df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=10).rsi()
-    
-    # 0.05% และ 0.15% เหมาะสมกับระยะสวิงของแท่ง 5m ในตลาด Forex
     pivots_fast = calculate_zigzag(df, deviation_pct=0.05)
     pivots_slow = calculate_zigzag(df, deviation_pct=0.15)
 
-    idx = len(df) - 1
-    fast_val = pivots_fast[idx] or pivots_fast[idx - 1]
-    slow_val = pivots_slow[idx] or pivots_slow[idx - 1]
-
     closed = df.iloc[-1]
+    
+    # ขยายกรอบการชนกันเป็น 3 แท่งล่าสุดสำหรับ Slow ZigZag
+    slow_window = pivots_slow[-3:]
+    has_slow_bottom = -1 in slow_window
+    has_slow_top = 1 in slow_window
+
+    has_fast_bottom = (pivots_fast[-1] == -1 or pivots_fast[-2] == -1)
+    has_fast_top = (pivots_fast[-1] == 1 or pivots_fast[-2] == 1)
+
     total_range = closed['High'] - closed['Low']
     if total_range == 0:
         return closed, False, False
 
     upper_wick = closed['High'] - max(closed['Close'], closed['Open'])
     lower_wick = min(closed['Close'], closed['Open']) - closed['Low']
-    
-    # เงื่อนไข CALL (Dual ZigZag Confluence ชนล่าง + ปฏิเสธราคา + RSI Oversold Zone)
+
+    # 1. เงื่อนไข CALL (ขยายโอกาสเข้าเทรด)
     call_candidate = (
-        (fast_val == -1 and slow_val == -1) and
-        (lower_wick / total_range >= 0.35 or closed['Close'] > closed['Open']) and
-        (closed['rsi'] <= 42)
+        (has_slow_bottom and has_fast_bottom) and
+        (lower_wick / total_range >= 0.20 or closed['Close'] > closed['Open']) and
+        (closed['rsi'] <= 45)
     )
-    
-    # เงื่อนไข PUT (Dual ZigZag Confluence ชนบน + ปฏิเสธราคา + RSI Overbought Zone)
+
+    # 2. เงื่อนไข PUT
     put_candidate = (
-        (fast_val == 1 and slow_val == 1) and
-        (upper_wick / total_range >= 0.35 or closed['Close'] < closed['Open']) and
-        (closed['rsi'] >= 58)
+        (has_slow_top and has_fast_top) and
+        (upper_wick / total_range >= 0.20 or closed['Close'] < closed['Open']) and
+        (closed['rsi'] >= 55)
     )
 
     return closed, call_candidate, put_candidate
@@ -148,7 +151,7 @@ def ask_groq_ai_zigzag(pair: str, tf: str, closed_row, setup_type: str):
         print(f"Groq API error: {e}")
         return None
 
-# --- 3. Backtest Engine สำหรับหน้าเว็บ Dashboard ---
+# --- 3. Backtest Engine ---
 def execute_backtest(pair: str, tf: str, days: int):
     ticker = ALL_PAIRS.get(pair)
     if not ticker:
@@ -168,8 +171,13 @@ def execute_backtest(pair: str, tf: str, days: int):
     wins, losses, draws = 0, 0, 0
 
     for i in range(20, len(df) - 1):
-        f_val = pivots_fast[i]
-        s_val = pivots_slow[i]
+        slow_win = pivots_slow[i-2 : i+1]
+        has_slow_b = -1 in slow_win
+        has_slow_t = 1 in slow_win
+
+        has_fast_b = (pivots_fast[i] == -1 or pivots_fast[i-1] == -1)
+        has_fast_t = (pivots_fast[i] == 1 or pivots_fast[i-1] == 1)
+
         closed = df.iloc[i]
         next_candle = df.iloc[i + 1]
 
@@ -181,15 +189,15 @@ def execute_backtest(pair: str, tf: str, days: int):
         lower_wick = min(closed['Close'], closed['Open']) - closed['Low']
 
         call_cond = (
-            (f_val == -1 and s_val == -1) and
-            (lower_wick / total_range >= 0.35 or closed['Close'] > closed['Open']) and
-            (closed['rsi'] <= 42)
+            (has_slow_b and has_fast_b) and
+            (lower_wick / total_range >= 0.20 or closed['Close'] > closed['Open']) and
+            (closed['rsi'] <= 45)
         )
         
         put_cond = (
-            (f_val == 1 and s_val == 1) and
-            (upper_wick / total_range >= 0.35 or closed['Close'] < closed['Open']) and
-            (closed['rsi'] >= 58)
+            (has_slow_t and has_fast_t) and
+            (upper_wick / total_range >= 0.20 or closed['Close'] < closed['Open']) and
+            (closed['rsi'] >= 55)
         )
 
         signal = "CALL" if call_cond else ("PUT" if put_cond else None)
@@ -285,7 +293,7 @@ def render_dashboard():
     </head>
     <body>
         <div class="container">
-            <h2>⚡ Binary AI Pro: ZigZag (0.05 & 0.15) + Rejection Engine</h2>
+            <h2>⚡ Binary AI Pro: High-Frequency ZigZag Engine</h2>
             
             <div class="stats-grid">
                 <div class="stat-box">
@@ -306,9 +314,8 @@ def render_dashboard():
                 </div>
             </div>
 
-            <!-- กล่องทดสอบ Backtest -->
             <div class="card" style="border: 1px solid #3b82f6;">
-                <h3>🧪 ทดสอบย้อนหลัง ZigZag 0.05 & 0.15 (Backtest)</h3>
+                <h3>🧪 ทดสอบย้อนหลัง ZigZag Confluence (Backtest)</h3>
                 <form action="/run-backtest" method="post" style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
                     <div>
                         <label>เลือกคู่เงิน:</label>
@@ -335,7 +342,6 @@ def render_dashboard():
                 </form>
             </div>
 
-            <!-- กล่องตั้งค่า Watchlist -->
             <div class="card">
                 <h3>🎯 ตั้งค่าโฟกัสคู่เงิน (บันทึกลง Database อัตโนมัติ)</h3>
                 <form action="/update-watchlist" method="post">
@@ -346,7 +352,6 @@ def render_dashboard():
                 </form>
             </div>
 
-            <!-- กล่องตารางสถิติ Real-time -->
             <div class="card">
                 <h3>📊 สถิติการรันจริง (Live Signals)</h3>
                 <table>
@@ -398,7 +403,7 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
     <body>
         <div class="box">
             <h2>📈 ผลการทดสอบ Backtest: {res['pair']} ({res['timeframe']})</h2>
-            <p style="color: #94a3b8;">กลยุทธ์: <b>ZigZag 0.05% & 0.15% Confluence + Rejection</b> (ย้อนหลัง {res['days']} วัน)</p>
+            <p style="color: #94a3b8;">กลยุทธ์: <b>High-Frequency ZigZag Confluence</b> (ย้อนหลัง {res['days']} วัน)</p>
             <div class="stat">Win Rate: {res['winrate']}%</div>
             <p>• สัญญาณทั้งหมดที่เข้าเกณฑ์: <b>{res['total']}</b> ไม้</p>
             <p>• ชนะ (WIN): <b style="color: #4ade80;">{res['wins']}</b> ไม้</p>
@@ -419,7 +424,7 @@ def update_watchlist(pairs: list[str] = Form(default=[])):
     send_telegram(f"⚙️ *มีการบันทึก Watchlist ใหม่ลง Database:*\n`{', '.join(active_pairs)}`")
     return HTMLResponse(content="""<script>alert("บันทึกสำเร็จ!"); window.location.href = "/";</script>""")
 
-# --- 5. Telegram & Helper Functions ---
+# --- 5. Telegram & Timing Helpers ---
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -452,7 +457,7 @@ def sleep_until_next_5m_candle():
 # --- 6. Threads ---
 def synchronized_trading_loop():
     time.sleep(5)
-    send_telegram("🚀 *ระบบ Binary ZigZag (0.05 & 0.15) + Rejection AI เริ่มทำงานแล้ว (24/7)*")
+    send_telegram("🚀 *ระบบ Binary ZigZag High-Frequency AI เริ่มทำงานแล้ว (24/7)*")
     
     while True:
         try:
@@ -497,7 +502,7 @@ def synchronized_trading_loop():
                             msg = (
                                 f"{icon} *สัญญาณเข้าเทรดแท่งใหม่ ({setup})*\n"
                                 f"━━━━━━━━━━━━━━━\n"
-                                f"📐 **ตัวบ่งชี้:** `ZigZag 0.05 & 0.15 + Rejection`\n"
+                                f"📐 **ตัวบ่งชี้:** `High-Frequency ZigZag Confluence`\n"
                                 f"📊 **คู่เงิน:** `{name}`\n"
                                 f"⏱ **Timeframe:** `{tf}`\n"
                                 f"🏁 **หมดเวลาที่:** `{expiry_time} UTC`\n"
@@ -619,7 +624,7 @@ def telegram_polling_loop():
 
                     elif text in ["/help", "/start"]:
                         msg_help = (
-                            f"📌 *บอท ZigZag 0.05 & 0.15 พร้อมทำงาน!*\nChat ID: `{sender_chat_id}`\n\n"
+                            f"📌 *บอท ZigZag High-Frequency พร้อมทำงาน!*\nChat ID: `{sender_chat_id}`\n\n"
                             f"• `/focus EUR/USD` - เลือกคู่เงิน\n"
                             f"• `/focus all` - เฝ้าทุกคู่\n"
                             f"• `/watchlist` - ดูคู่เงินที่กำลังเฝ้า\n"
