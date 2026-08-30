@@ -19,12 +19,19 @@ PORT = int(os.getenv("PORT", 8080))
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-WATCHLIST = {
+# รายการคู่เงินทั้งหมดที่รองรับ
+ALL_PAIRS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "USD/JPY": "JPY=X",
-    "AUD/USD": "AUDUSD=X"
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "USD/CHF": "CHF=X",
+    "BTC/USD": "BTC-USD"
 }
+
+# เริ่มต้นเฝ้าทุกคู่เงิน
+active_pairs = list(ALL_PAIRS.keys())
 TIMEFRAMES = ["5m", "15m"]
 
 app = FastAPI()
@@ -44,7 +51,17 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"Telegram send error: {e}")
 
-# --- Technical Analysis & Groq ---
+def send_telegram_direct(chat_id, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Telegram direct error: {e}")
+
+# --- Technical Analysis & Groq AI ---
 def analyze_technical(df: pd.DataFrame):
     df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=14).rsi()
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
@@ -83,7 +100,7 @@ def ask_groq_ai(pair: str, tf: str, last_row, setup_type: str):
         print(f"Groq API error: {e}")
         return None
 
-# --- Thread 1: Signal Scanner Loop ---
+# --- Thread 1: Market Scanner Loop ---
 def trading_bot_loop():
     time.sleep(5)
     db.init_db()
@@ -91,7 +108,10 @@ def trading_bot_loop():
     
     while True:
         try:
-            for name, ticker in WATCHLIST.items():
+            current_focus = [p for p in active_pairs if p in ALL_PAIRS]
+            
+            for name in current_focus:
+                ticker = ALL_PAIRS[name]
                 for tf in TIMEFRAMES:
                     period = "1d" if tf == "5m" else "5d"
                     df = yf.download(ticker, period=period, interval=tf, progress=False)
@@ -117,7 +137,7 @@ def trading_bot_loop():
                                 f"{icon} *สัญญาณเข้าเทรด ({setup})*\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"📊 **คู่เงิน:** `{name}`\n"
-                                f"⏱ **Expiry:** `{tf}`\n"
+                                f"⏱ **Expiry:** `{tf}` (หมดอายุในอีก {tf})\n"
                                 f"💵 **ราคาเข้า:** `{entry_price:.5f}`\n"
                                 f"🎯 **ความมั่นใจ:** `{conf}%`\n"
                                 f"💡 **เหตุผล:** {reason}\n"
@@ -130,7 +150,7 @@ def trading_bot_loop():
             print(f"Scanner error: {e}")
             time.sleep(30)
 
-# --- Thread 2: Outcome Checker Loop (ตรวจผล WIN/LOSS) ---
+# --- Thread 2: Outcome Checker Loop ---
 def outcome_checker_loop():
     time.sleep(10)
     while True:
@@ -142,13 +162,11 @@ def outcome_checker_loop():
                 duration_min = 5 if sig["timeframe"] == "5m" else 15
                 target_expiry = sig["created_at"] + datetime.timedelta(minutes=duration_min)
                 
-                # เช็คเฉพาะสัญญาณที่เวลาผ่านไปจนหมดแท่งเทียนแล้ว
                 if now >= target_expiry:
-                    ticker = WATCHLIST.get(sig["pair"])
+                    ticker = ALL_PAIRS.get(sig["pair"])
                     if not ticker:
                         continue
                     
-                    # ดึงราคาปัจจุบันเพื่อเทียบผลลัพธ์
                     df = yf.download(ticker, period="1d", interval="1m", progress=False)
                     if df.empty:
                         continue
@@ -158,16 +176,13 @@ def outcome_checker_loop():
                     expiry_price = float(df.iloc[-1]['Close'])
                     entry_price = float(sig['entry_price'])
                     
-                    # ประเมินผลลัพธ์
                     if sig['direction'] == "CALL":
                         result = "WIN" if expiry_price > entry_price else ("LOSS" if expiry_price < entry_price else "DRAW")
-                    else: # PUT
+                    else:
                         result = "WIN" if expiry_price < entry_price else ("LOSS" if expiry_price > entry_price else "DRAW")
                     
-                    # บันทึกผลลง Neon
                     db.save_result(sig['id'], expiry_price, result)
                     
-                    # แจ้งเตือนผลลัพธ์เข้า Telegram
                     res_icon = "✅ WIN" if result == "WIN" else ("❌ LOSS" if result == "LOSS" else "⚪ DRAW")
                     msg = (
                         f"🔔 *สรุปผลการเทรด: {res_icon}*\n"
@@ -185,8 +200,9 @@ def outcome_checker_loop():
             print(f"Outcome checker error: {e}")
             time.sleep(30)
 
-# --- Thread 3: Telegram Command Handler (/stat, /help) ---
+# --- Thread 3: Telegram Polling Loop ---
 def telegram_polling_loop():
+    global active_pairs
     last_update_id = 0
     while True:
         try:
@@ -201,31 +217,67 @@ def telegram_polling_loop():
                 for item in res.get("result", []):
                     last_update_id = item["update_id"]
                     msg = item.get("message", {})
-                    text = msg.get("text", "")
+                    text = msg.get("text", "").strip()
+                    sender_chat_id = msg.get("chat", {}).get("id")
                     
-                    if text == "/stat":
-                        stats = db.fetch_winrate()
-                        if not stats:
-                            send_telegram("📊 *ยังไม่มีข้อมูลสถิติการเทรดที่สรุปผลแล้ว*")
+                    if not sender_chat_id:
+                        continue
+
+                    if text.startswith("/focus"):
+                        parts = text.split(" ", 1)
+                        if len(parts) < 2 or parts[1].strip().lower() == "all":
+                            active_pairs = list(ALL_PAIRS.keys())
+                            send_telegram_direct(sender_chat_id, "✅ *ตั้งค่าโฟกัส:* เฝ้าดู **ทุกคู่เงิน**")
                         else:
-                            report = "📈 *สรุปสถิติ Win Rate รวม:*\n━━━━━━━━━━━━━━━\n"
-                            for row in stats:
-                                rate = row['win_rate_percentage'] or 0
-                                report += (
-                                    f"🔹 *{row['pair']} ({row['timeframe']})*\n"
-                                    f"   • ทั้งหมด: `{row['total_trades']}` ไม้\n"
-                                    f"   • ชนะ: `{row['wins']}` | แพ้: `{row['losses']}` | เสมอ: `{row['draws']}`\n"
-                                    f"   • Win Rate: *{rate}%*\n\n"
-                                )
-                            send_telegram(report)
-                    elif text == "/help":
-                        send_telegram("📌 *คำสั่งที่ใช้งานได้:*\n`/stat` - ดูอัตรา Win Rate ปัจจุบัน\n`/help` - ดูคำอธิบายการใช้งาน")
+                            selected = [p.strip().upper() for p in parts[1].split(",") if p.strip().upper() in ALL_PAIRS]
+                            if selected:
+                                active_pairs = selected
+                                pairs_text = ", ".join(active_pairs)
+                                send_telegram_direct(sender_chat_id, f"🎯 *ตั้งค่าโฟกัสสำเร็จ!*\nกำลังเฝ้าเฉพาะ: `{pairs_text}`")
+                            else:
+                                send_telegram_direct(sender_chat_id, "⚠️ ไม่พบคู่เงินที่ระบุ กรุณาพิมพ์เช่น `/focus EUR/USD,GBP/USD`")
+
+                    elif text == "/watchlist":
+                        current = ", ".join(active_pairs)
+                        available = ", ".join(ALL_PAIRS.keys())
+                        send_telegram_direct(sender_chat_id, f"📋 *คู่เงินที่กำลังเฝ้าดู:*\n`{current}`\n\n🔹 *คู่เงินทั้งหมดที่มี:* `{available}`")
+
+                    elif text == "/stat":
+                        try:
+                            stats = db.fetch_winrate()
+                            if not stats:
+                                send_telegram_direct(sender_chat_id, "📊 *ยังไม่มีข้อมูลสถิติการเทรดที่สรุปผลแล้ว*")
+                            else:
+                                report = "📈 *สรุปสถิติ Win Rate รวม:*\n━━━━━━━━━━━━━━━\n"
+                                for row in stats:
+                                    rate = row.get('win_rate_percentage') or 0
+                                    report += (
+                                        f"🔹 *{row['pair']} ({row['timeframe']})*\n"
+                                        f"   • ทั้งหมด: `{row['total_trades']}` ไม้\n"
+                                        f"   • ชนะ: `{row['wins']}` | แพ้: `{row['losses']}` | เสมอ: `{row['draws']}`\n"
+                                        f"   • Win Rate: *{rate}%*\n\n"
+                                    )
+                                send_telegram_direct(sender_chat_id, report)
+                        except Exception as db_err:
+                            send_telegram_direct(sender_chat_id, f"❌ Database Error: `{db_err}`")
+
+                    elif text in ["/help", "/start"]:
+                        msg_help = (
+                            f"📌 *บอทพร้อมทำงาน!*\n"
+                            f"Chat ID: `{sender_chat_id}`\n\n"
+                            f"• `/focus EUR/USD,GBP/USD` - เลือกคู่เงินที่ต้องการ\n"
+                            f"• `/focus all` - เฝ้าทุกคู่เงิน\n"
+                            f"• `/watchlist` - ดูคู่เงินที่กำลังเฝ้าอยู่\n"
+                            f"• `/stat` - ดูอัตรา Win Rate รวม\n"
+                            f"• `/help` - แสดงเมนูช่วยเหลือ"
+                        )
+                        send_telegram_direct(sender_chat_id, msg_help)
             
             time.sleep(1)
         except Exception as e:
             time.sleep(5)
 
-# --- เริ่มรันทุก Thread ---
+# --- Start Background Threads ---
 threading.Thread(target=trading_bot_loop, daemon=True).start()
 threading.Thread(target=outcome_checker_loop, daemon=True).start()
 threading.Thread(target=telegram_polling_loop, daemon=True).start()
