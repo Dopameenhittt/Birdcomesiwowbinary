@@ -3,6 +3,7 @@ import time
 import datetime
 import threading
 import requests
+import numpy as np
 import pandas as pd
 import ta
 import yfinance as yf
@@ -36,95 +37,87 @@ TIMEFRAMES = ["5m", "15m"]
 
 app = FastAPI()
 
-# --- 1. Economic News Filter (Forex Factory Free Feed) ---
-high_impact_news = []
-last_news_fetch = None
+# --- 1. ZigZag 0.1 & 0.5 Engine ---
+def calculate_zigzag(df: pd.DataFrame, deviation_pct: float):
+    threshold = deviation_pct / 100.0
+    pivots = np.zeros(len(df))
+    last_pivot_type = 0
+    last_pivot_val = df['Close'].iloc[0]
+    last_pivot_idx = 0
 
-def fetch_economic_calendar():
-    global high_impact_news, last_news_fetch
-    now = datetime.datetime.now(datetime.timezone.utc)
-    if last_news_fetch and (now - last_news_fetch).total_seconds() < 3600:
-        return
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        res = requests.get(url, timeout=10).json()
-        high_impact = []
-        for item in res:
-            if item.get("impact") == "High":
-                news_time = datetime.datetime.fromisoformat(item["date"].replace("Z", "+00:00"))
-                high_impact.append({
-                    "title": item.get("title"),
-                    "currency": item.get("country"),
-                    "time": news_time
-                })
-        high_impact_news = high_impact
-        last_news_fetch = now
-    except Exception as e:
-        print(f"News fetch error: {e}")
+    for i in range(1, len(df)):
+        current_high = df['High'].iloc[i]
+        current_low = df['Low'].iloc[i]
 
-def is_near_news(pair: str) -> tuple[bool, str]:
-    fetch_economic_calendar()
-    now = datetime.datetime.now(datetime.timezone.utc)
-    currencies = pair.replace("/", " ").split()
-    for event in high_impact_news:
-        if event["currency"] in currencies:
-            time_diff = (event["time"] - now).total_seconds() / 60.0
-            if -15 <= time_diff <= 15:
-                return True, f"⚠️ ข่าว High Impact: {event['title']} ({event['currency']})"
-    return False, ""
+        if last_pivot_type == 0:
+            if (current_high - last_pivot_val) / last_pivot_val >= threshold:
+                last_pivot_type = 1
+                last_pivot_val = current_high
+                last_pivot_idx = i
+            elif (last_pivot_val - current_low) / last_pivot_val >= threshold:
+                last_pivot_type = -1
+                last_pivot_val = current_low
+                last_pivot_idx = i
+        elif last_pivot_type == 1:
+            if current_high > last_pivot_val:
+                last_pivot_val = current_high
+                last_pivot_idx = i
+            elif (last_pivot_val - current_low) / last_pivot_val >= threshold:
+                pivots[last_pivot_idx] = 1
+                last_pivot_type = -1
+                last_pivot_val = current_low
+                last_pivot_idx = i
+        elif last_pivot_type == -1:
+            if current_low < last_pivot_val:
+                last_pivot_val = current_low
+                last_pivot_idx = i
+            elif (current_high - last_pivot_val) / last_pivot_val >= threshold:
+                pivots[last_pivot_idx] = -1
+                last_pivot_type = 1
+                last_pivot_val = current_high
+                last_pivot_idx = i
 
-# --- 2. High-Frequency Technical Setup (10-30 ไม้/วัน) ---
-def analyze_advanced_technical(df: pd.DataFrame):
-    df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=7).rsi()
-    bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
-    df['bb_upper'] = bb.bollinger_hband()
-    df['bb_lower'] = bb.bollinger_lband()
-    df['ema_20'] = ta.trend.EMAIndicator(df['Close'], window=20).ema_indicator()
-    
+    if last_pivot_type == 1:
+        pivots[last_pivot_idx] = 1
+    elif last_pivot_type == -1:
+        pivots[last_pivot_idx] = -1
+
+    return pivots
+
+def analyze_zigzag_setup(df: pd.DataFrame):
+    df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=14).rsi()
+    pivots_fast = calculate_zigzag(df, deviation_pct=0.1) # Fast ZigZag
+    pivots_slow = calculate_zigzag(df, deviation_pct=0.5) # Slow ZigZag
+
+    idx = len(df) - 1
+    fast_val = pivots_fast[idx] or pivots_fast[idx - 1]
+    slow_val = pivots_slow[idx] or pivots_slow[idx - 1]
+
     closed = df.iloc[-1]
-    prev = df.iloc[-2]
     
-    body_size = abs(closed['Close'] - closed['Open'])
-    upper_wick = closed['High'] - max(closed['Close'], closed['Open'])
-    lower_wick = min(closed['Close'], closed['Open']) - closed['Low']
-    
-    # 1. เงื่อนไข CALL (Mean-Reversion ไว)
-    call_candidate = (
-        (closed['Low'] <= closed['bb_lower'] or prev['Low'] <= prev['bb_lower']) and
-        (closed['Close'] > closed['bb_lower']) and
-        (closed['rsi'] <= 28) and
-        (lower_wick >= body_size * 0.4 or closed['Close'] > closed['Open'])
-    )
-    
-    # 2. เงื่อนไข PUT
-    put_candidate = (
-        (closed['High'] >= closed['bb_upper'] or prev['High'] >= prev['bb_upper']) and
-        (closed['Close'] < closed['bb_upper']) and
-        (closed['rsi'] >= 72) and
-        (upper_wick >= body_size * 0.4 or closed['Close'] < closed['Open'])
-    )
-    
-    recent_window = df.iloc[-30:-1]
-    support_level = float(recent_window['Low'].min())
-    resistance_level = float(recent_window['High'].max())
-    
-    return closed, call_candidate, put_candidate, support_level, resistance_level
+    # ชนกันเป็นก้นแหลมล่าง -> CALL
+    call_candidate = (fast_val == -1 and slow_val == -1)
+    # ชนกันเป็นยอดแหลมบน -> PUT
+    put_candidate = (fast_val == 1 and slow_val == 1)
 
-def ask_groq_ai_advanced(pair: str, tf: str, closed_row, setup_type: str, support: float, resistance: float):
+    return closed, call_candidate, put_candidate
+
+def ask_groq_ai_zigzag(pair: str, tf: str, closed_row, setup_type: str):
     if not groq_client:
         return None
     prompt = f"""
-    Binary Options 1-Candle Reversal Scanner.
-    Asset: {pair} | TF: {tf} | Setup: {setup_type}
-    Data:
+    You are an elite Binary Options Price Action Specialist.
+    Asset: {pair} | Timeframe: {tf}
+    CORE TRIGGER: ZigZag 0.1% and ZigZag 0.5% have CONVERGED at an extreme point (Dual Sharp Peak/Valley).
+    Setup Direction: Potential {setup_type} for NEXT candle.
+    Closed Candle Details:
     - Close: {closed_row['Close']:.5f}
-    - Fast RSI(7): {closed_row['rsi']:.2f}
-    - BB Upper: {closed_row['bb_upper']:.5f} | BB Lower: {closed_row['bb_lower']:.5f}
-    - EMA 20: {closed_row['ema_20']:.5f}
+    - Open: {closed_row['Open']:.5f}
+    - RSI(14): {closed_row['rsi']:.2f}
 
-    Is this mean-reversion setup valid for an immediate 1-candle expiry?
-    Respond ONLY in strict JSON format:
-    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<short 1-sentence reasoning>"}}
+    Confirm if the rejection is strong enough for an immediate 1-candle reversal.
+    Respond ONLY in strict JSON:
+    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<1-sentence reasoning about ZigZag confluence & price rejection>"}}
     """
     try:
         res = groq_client.chat.completions.create(
@@ -138,7 +131,7 @@ def ask_groq_ai_advanced(pair: str, tf: str, closed_row, setup_type: str, suppor
         print(f"Groq API error: {e}")
         return None
 
-# --- 3. Backtest Engine สำหรับหน้าเว็บ ---
+# --- 2. Backtest Engine สำหรับ ZigZag ---
 def execute_backtest(pair: str, tf: str, days: int):
     ticker = ALL_PAIRS.get(pair)
     if not ticker:
@@ -151,37 +144,22 @@ def execute_backtest(pair: str, tf: str, days: int):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=7).rsi()
-    bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
-    df['bb_upper'] = bb.bollinger_hband()
-    df['bb_lower'] = bb.bollinger_lband()
+    pivots_fast = calculate_zigzag(df, deviation_pct=0.1)
+    pivots_slow = calculate_zigzag(df, deviation_pct=0.5)
 
     wins, losses, draws = 0, 0, 0
 
-    for i in range(30, len(df) - 1):
-        prev = df.iloc[i - 1]
+    for i in range(20, len(df) - 1):
+        f_val = pivots_fast[i]
+        s_val = pivots_slow[i]
         closed = df.iloc[i]
         next_candle = df.iloc[i + 1]
 
-        body_size = abs(closed['Close'] - closed['Open'])
-        upper_wick = closed['High'] - max(closed['Close'], closed['Open'])
-        lower_wick = min(closed['Close'], closed['Open']) - closed['Low']
-
-        call_cond = (
-            (closed['Low'] <= closed['bb_lower'] or prev['Low'] <= prev['bb_lower']) and
-            (closed['Close'] > closed['bb_lower']) and
-            (closed['rsi'] <= 28) and
-            (lower_wick >= body_size * 0.4 or closed['Close'] > closed['Open'])
-        )
-        
-        put_cond = (
-            (closed['High'] >= closed['bb_upper'] or prev['High'] >= prev['bb_upper']) and
-            (closed['Close'] < closed['bb_upper']) and
-            (closed['rsi'] >= 72) and
-            (upper_wick >= body_size * 0.4 or closed['Close'] < closed['Open'])
-        )
-
-        signal = "CALL" if call_cond else ("PUT" if put_cond else None)
+        signal = None
+        if f_val == -1 and s_val == -1:
+            signal = "CALL"
+        elif f_val == 1 and s_val == 1:
+            signal = "PUT"
 
         if signal:
             entry_p = float(closed['Close'])
@@ -213,7 +191,7 @@ def execute_backtest(pair: str, tf: str, days: int):
         "winrate": winrate
     }
 
-# --- 4. Web Dashboard UI ---
+# --- 3. Web Dashboard UI ---
 @app.get("/", response_class=HTMLResponse)
 def render_dashboard():
     stats = db.fetch_winrate()
@@ -257,7 +235,7 @@ def render_dashboard():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Binary AI Control Center</title>
+        <title>Binary ZigZag AI Control</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }}
             .container {{ max-width: 1000px; margin: auto; }}
@@ -274,7 +252,7 @@ def render_dashboard():
     </head>
     <body>
         <div class="container">
-            <h2>⚡ Binary AI Pro: Control & Backtest Dashboard</h2>
+            <h2>⚡ Binary AI Pro: Dual ZigZag (0.1 & 0.5) Confluence</h2>
             
             <div class="stats-grid">
                 <div class="stat-box">
@@ -296,7 +274,7 @@ def render_dashboard():
             </div>
 
             <div class="card" style="border: 1px solid #3b82f6;">
-                <h3>🧪 ทดสอบย้อนหลัง (Backtest Historical Data)</h3>
+                <h3>🧪 ทดสอบย้อนหลัง ZigZag 0.1 & 0.5 (Backtest)</h3>
                 <form action="/run-backtest" method="post" style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
                     <div>
                         <label>เลือกคู่เงิน:</label>
@@ -384,7 +362,7 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
     <body>
         <div class="box">
             <h2>📈 ผลการทดสอบ Backtest: {res['pair']} ({res['timeframe']})</h2>
-            <p style="color: #94a3b8;">ช่วงเวลา: ย้อนหลัง {res['days']} วันที่ผ่านมา</p>
+            <p style="color: #94a3b8;">กลยุทธ์: <b>Dual ZigZag 0.1% & 0.5% Confluence</b> (ย้อนหลัง {res['days']} วัน)</p>
             <div class="stat">Win Rate: {res['winrate']}%</div>
             <p>• สัญญาณทั้งหมดที่เข้าเกณฑ์: <b>{res['total']}</b> ไม้</p>
             <p>• ชนะ (WIN): <b style="color: #4ade80;">{res['wins']}</b> ไม้</p>
@@ -405,7 +383,7 @@ def update_watchlist(pairs: list[str] = Form(default=[])):
     send_telegram(f"⚙️ *มีการบันทึก Watchlist ใหม่ลง Database:*\n`{', '.join(active_pairs)}`")
     return HTMLResponse(content="""<script>alert("บันทึกสำเร็จ!"); window.location.href = "/";</script>""")
 
-# --- 5. Telegram & Helper Functions ---
+# --- 4. Helper Functions ---
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -435,11 +413,10 @@ def sleep_until_next_5m_candle():
         sleep_seconds += 300
     return sleep_seconds
 
-# --- 6. Threads ---
+# --- 5. Threads ---
 def synchronized_trading_loop():
     time.sleep(5)
-    fetch_economic_calendar()
-    send_telegram("🚀 *ระบบ Binary AI Pro (High-Frequency 10-30 ไม้/วัน) เริ่มทำงานแล้ว (24/7)*")
+    send_telegram("🚀 *ระบบ Binary Dual ZigZag (0.1 & 0.5) AI เริ่มทำงานแล้ว (24/7)*")
     
     while True:
         try:
@@ -457,10 +434,6 @@ def synchronized_trading_loop():
                 timeframes_to_check.append("15m")
 
             for name in current_focus:
-                near_news, _ = is_near_news(name)
-                if near_news:
-                    continue
-
                 ticker = ALL_PAIRS[name]
                 for tf in timeframes_to_check:
                     df = yf.download(ticker, period="5d", interval=tf, progress=False)
@@ -469,11 +442,11 @@ def synchronized_trading_loop():
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
 
-                    closed_candle, is_call, is_put, support, resistance = analyze_advanced_technical(df)
+                    closed_candle, is_call, is_put = analyze_zigzag_setup(df)
                     setup = "CALL" if is_call else ("PUT" if is_put else None)
                     
                     if setup:
-                        ai_res = ask_groq_ai_advanced(name, tf, closed_candle, setup, support, resistance)
+                        ai_res = ask_groq_ai_zigzag(name, tf, closed_candle, setup)
                         if ai_res and ai_res.get("confidence", 0) >= 70:
                             entry_price = float(closed_candle['Close'])
                             conf = float(ai_res['confidence'])
@@ -488,8 +461,9 @@ def synchronized_trading_loop():
                             msg = (
                                 f"{icon} *สัญญาณเข้าเทรดแท่งใหม่ ({setup})*\n"
                                 f"━━━━━━━━━━━━━━━\n"
+                                f"📐 **ตัวบ่งชี้:** `Dual ZigZag 0.1 & 0.5 Confluence`\n"
                                 f"📊 **คู่เงิน:** `{name}`\n"
-                                f"⏱ **Timeframe:** `{tf}` (เข้าแท่งนี้ทันที)\n"
+                                f"⏱ **Timeframe:** `{tf}`\n"
                                 f"🏁 **หมดเวลาที่:** `{expiry_time} UTC`\n"
                                 f"💵 **ราคาเปิดแท่ง:** `{entry_price:.5f}`\n"
                                 f"🎯 **ความมั่นใจ:** `{conf}%`\n"
@@ -578,14 +552,14 @@ def telegram_polling_loop():
                         if len(parts) < 2 or parts[1].strip().lower() == "all":
                             active_pairs = list(ALL_PAIRS.keys())
                             db.update_saved_watchlist(active_pairs)
-                            send_telegram_direct(sender_chat_id, "✅ *ตั้งค่าโฟกัส:* เฝ้าดู **ทุกคู่เงิน** (บันทึกลง Database แล้ว)")
+                            send_telegram_direct(sender_chat_id, "✅ *ตั้งค่าโฟกัส:* เฝ้าดู **ทุกคู่เงิน**")
                         else:
                             selected = [p.strip().upper() for p in parts[1].split(",") if p.strip().upper() in ALL_PAIRS]
                             if selected:
                                 active_pairs = selected
                                 db.update_saved_watchlist(active_pairs)
                                 pairs_text = ", ".join(active_pairs)
-                                send_telegram_direct(sender_chat_id, f"🎯 *ตั้งค่าโฟกัสสำเร็จ!*\nกำลังเฝ้าเฉพาะ: `{pairs_text}` (บันทึกลง Database แล้ว)")
+                                send_telegram_direct(sender_chat_id, f"🎯 *ตั้งค่าโฟกัสสำเร็จ!*\nกำลังเฝ้าเฉพาะ: `{pairs_text}`")
                             else:
                                 send_telegram_direct(sender_chat_id, "⚠️ ไม่พบคู่เงินที่ระบุ กรุณาพิมพ์เช่น `/focus EUR/USD,GBP/USD`")
 
@@ -609,7 +583,7 @@ def telegram_polling_loop():
 
                     elif text in ["/help", "/start"]:
                         msg_help = (
-                            f"📌 *บอทพร้อมทำงาน!*\nChat ID: `{sender_chat_id}`\n\n"
+                            f"📌 *บอท Dual ZigZag (0.1 & 0.5) พร้อมทำงาน!*\nChat ID: `{sender_chat_id}`\n\n"
                             f"• `/focus EUR/USD` - เลือกคู่เงิน\n"
                             f"• `/focus all` - เฝ้าทุกคู่\n"
                             f"• `/watchlist` - ดูคู่เงินที่กำลังเฝ้า\n"
@@ -621,7 +595,7 @@ def telegram_polling_loop():
         except Exception as e:
             time.sleep(5)
 
-# --- 7. Start Services ---
+# --- 6. Start Services ---
 threading.Thread(target=synchronized_trading_loop, daemon=True).start()
 threading.Thread(target=outcome_checker_loop, daemon=True).start()
 threading.Thread(target=telegram_polling_loop, daemon=True).start()
