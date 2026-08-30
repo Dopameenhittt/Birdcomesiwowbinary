@@ -19,7 +19,6 @@ PORT = int(os.getenv("PORT", 8080))
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# รายการคู่เงินทั้งหมดที่รองรับ
 ALL_PAIRS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
@@ -30,15 +29,12 @@ ALL_PAIRS = {
     "BTC/USD": "BTC-USD"
 }
 
-# เริ่มต้นเฝ้าทุกคู่เงิน
 active_pairs = list(ALL_PAIRS.keys())
-TIMEFRAMES = ["5m", "15m"]
-
 app = FastAPI()
 
 @app.get("/")
 def health_check():
-    return {"status": "active", "service": "Binary AI Bot 24/7"}
+    return {"status": "active", "service": "Binary AI Candle-Sync Bot 24/7"}
 
 # --- Telegram Helper Functions ---
 def send_telegram(text: str):
@@ -61,7 +57,7 @@ def send_telegram_direct(chat_id, text: str):
     except Exception as e:
         print(f"Telegram direct error: {e}")
 
-# --- Technical Analysis & Groq AI ---
+# --- Technical Analysis (ใช้แท่งเทียนที่ปิดสมบูรณ์แล้ว) ---
 def analyze_technical(df: pd.DataFrame):
     df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=14).rsi()
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
@@ -69,24 +65,28 @@ def analyze_technical(df: pd.DataFrame):
     df['bb_lower'] = bb.bollinger_lband()
     df['ema_50'] = ta.trend.EMAIndicator(df['Close'], window=50).ema_indicator()
     
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    # อ่านแท่งเทียนที่เพิ่งปิดตัวลง (Last Closed Candle)
+    closed_candle = df.iloc[-1]
+    prev_candle = df.iloc[-2]
     
-    call_candidate = (prev['Close'] <= prev['bb_lower']) and (last['Close'] > last['bb_lower']) and (last['rsi'] < 38)
-    put_candidate = (prev['Close'] >= prev['bb_upper']) and (last['Close'] < last['bb_upper']) and (last['rsi'] > 62)
-    return last, call_candidate, put_candidate
+    call_candidate = (prev_candle['Close'] <= prev_candle['bb_lower']) and (closed_candle['Close'] > closed_candle['bb_lower']) and (closed_candle['rsi'] < 38)
+    put_candidate = (prev_candle['Close'] >= prev_candle['bb_upper']) and (closed_candle['Close'] < closed_candle['bb_upper']) and (closed_candle['rsi'] > 62)
+    
+    return closed_candle, call_candidate, put_candidate
 
-def ask_groq_ai(pair: str, tf: str, last_row, setup_type: str):
+def ask_groq_ai(pair: str, tf: str, closed_row, setup_type: str):
     if not groq_client:
         return None
     prompt = f"""
     You are an elite Binary Options Price Action Specialist.
-    Asset: {pair}, Timeframe: {tf}, Setup: Potential {setup_type}
-    Current Price: {last_row['Close']}
-    RSI(14): {last_row['rsi']:.2f}, BB Upper: {last_row['bb_upper']:.2f}, BB Lower: {last_row['bb_lower']:.2f}, EMA 50: {last_row['ema_50']:.2f}
+    A candle has just CLOSED for Asset: {pair}, Timeframe: {tf}.
+    Detected Setup: Potential {setup_type} for NEXT candle.
+    Closed Price: {closed_row['Close']}
+    RSI(14): {closed_row['rsi']:.2f}, BB Upper: {closed_row['bb_upper']:.2f}, BB Lower: {closed_row['bb_lower']:.2f}, EMA 50: {closed_row['ema_50']:.2f}
 
-    Evaluate strength for 1-candle expiry. Respond ONLY in JSON:
-    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<short sentence>"}}
+    Evaluate if the NEXT candle will continue the mean-reversion.
+    Respond ONLY in strict JSON:
+    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<short 1-sentence reasoning>"}}
     """
     try:
         res = groq_client.chat.completions.create(
@@ -100,19 +100,42 @@ def ask_groq_ai(pair: str, tf: str, last_row, setup_type: str):
         print(f"Groq API error: {e}")
         return None
 
-# --- Thread 1: Market Scanner Loop ---
-def trading_bot_loop():
+# --- ฟังก์ชันคำนวณเวลารอจนถึงรอบแท่งเทียนถัดไป (เช่น :00, :05, :10) ---
+def sleep_until_next_5m_candle():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # หาเศษนาทีที่เหลือจนถึงรอบ 5 นาทีถัดไป
+    minutes_to_next = 5 - (now.minute % 5)
+    target_time = (now + datetime.timedelta(minutes=minutes_to_next)).replace(second=2, microsecond=0)
+    sleep_seconds = (target_time - now).total_seconds()
+    if sleep_seconds < 0:
+        sleep_seconds += 300
+    return sleep_seconds
+
+# --- Thread 1: Synchronized Market Scanner Loop ---
+def synchronized_trading_loop():
     time.sleep(5)
     db.init_db()
-    send_telegram("🚀 *ระบบ Binary AI Scanner พร้อมทำงานแล้ว (24/7)*")
+    send_telegram("🚀 *ระบบ Binary AI (Bar-Close Sync) เริ่มทำงานแล้ว (24/7)*")
     
     while True:
         try:
+            # 1. รอจนกว่าจะถึงวินาทีที่ 02 ของรอบ 5 นาทีถัดไป
+            wait_time = sleep_until_next_5m_candle()
+            time.sleep(wait_time)
+            
+            current_utc = datetime.datetime.now(datetime.timezone.utc)
+            current_minute = current_utc.minute
+            
+            # เลือกว่าจะเช็ค Timeframe ไหนบ้างในรอบนี้
+            timeframes_to_check = ["5m"]
+            if current_minute % 15 == 0:
+                timeframes_to_check.append("15m") # ถ้าเป็นนาที 00, 15, 30, 45 ให้ตรวจ 15m ด้วย
+
             current_focus = [p for p in active_pairs if p in ALL_PAIRS]
             
             for name in current_focus:
                 ticker = ALL_PAIRS[name]
-                for tf in TIMEFRAMES:
+                for tf in timeframes_to_check:
                     period = "1d" if tf == "5m" else "5d"
                     df = yf.download(ticker, period=period, interval=tf, progress=False)
                     if df.empty or len(df) < 50:
@@ -120,47 +143,53 @@ def trading_bot_loop():
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
 
-                    last, is_call, is_put = analyze_technical(df)
+                    closed_candle, is_call, is_put = analyze_technical(df)
                     setup = "CALL" if is_call else ("PUT" if is_put else None)
                     
                     if setup:
-                        ai_res = ask_groq_ai(name, tf, last, setup)
+                        ai_res = ask_groq_ai(name, tf, closed_row=closed_candle, setup_type=setup)
                         if ai_res and ai_res.get("confidence", 0) >= 80:
-                            entry_price = float(last['Close'])
+                            entry_price = float(closed_candle['Close'])
                             conf = float(ai_res['confidence'])
                             reason = ai_res.get('reason', '')
                             
                             sig_id = db.save_signal(name, tf, setup, entry_price, conf, reason)
                             
+                            # คำนวณเวลาหมดอายุที่แน่นอน
+                            duration_mins = 5 if tf == "5m" else 15
+                            expiry_time = (current_utc + datetime.timedelta(minutes=duration_mins)).strftime('%H:%M')
+                            
                             icon = "🟢" if setup == "CALL" else "🔴"
                             msg = (
-                                f"{icon} *สัญญาณเข้าเทรด ({setup})*\n"
+                                f"{icon} *สัญญาณเข้าเทรดแท่งใหม่ ({setup})*\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"📊 **คู่เงิน:** `{name}`\n"
-                                f"⏱ **Expiry:** `{tf}` (หมดอายุในอีก {tf})\n"
-                                f"💵 **ราคาเข้า:** `{entry_price:.5f}`\n"
+                                f"⏱ **Timeframe:** `{tf}` (เข้าแท่งนี้ทันที)\n"
+                                f"🏁 **หมดเวลาที่:** `{expiry_time} UTC` (จบแท่ง)\n"
+                                f"💵 **ราคาเปิดแท่ง:** `{entry_price:.5f}`\n"
                                 f"🎯 **ความมั่นใจ:** `{conf}%`\n"
                                 f"💡 **เหตุผล:** {reason}\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"🆔 `Ref ID: #{sig_id}`"
                             )
                             send_telegram(msg)
-            time.sleep(60)
+                            
         except Exception as e:
             print(f"Scanner error: {e}")
-            time.sleep(30)
+            time.sleep(10)
 
 # --- Thread 2: Outcome Checker Loop ---
 def outcome_checker_loop():
-    time.sleep(10)
+    time.sleep(15)
     while True:
         try:
             pending = db.get_pending_signals()
-            now = datetime.datetime.utcnow()
+            now = datetime.datetime.now(datetime.timezone.utc)
             
             for sig in pending:
                 duration_min = 5 if sig["timeframe"] == "5m" else 15
-                target_expiry = sig["created_at"] + datetime.timedelta(minutes=duration_min)
+                target_expiry = sig["created_at"].replace(tzinfo=datetime.timezone.utc) if sig["created_at"].tzinfo is None else sig["created_at"]
+                target_expiry += datetime.timedelta(minutes=duration_min)
                 
                 if now >= target_expiry:
                     ticker = ALL_PAIRS.get(sig["pair"])
@@ -190,15 +219,15 @@ def outcome_checker_loop():
                         f"🆔 `Ref ID: #{sig['id']}`\n"
                         f"📊 **คู่เงิน:** `{sig['pair']}` ({sig['timeframe']})\n"
                         f"🎯 **คำสั่ง:** `{sig['direction']}`\n"
-                        f"💵 **ราคาเข้า:** `{entry_price:.5f}`\n"
-                        f"🏁 **ราคาปิด:** `{expiry_price:.5f}`"
+                        f"💵 **ราคาเปิด:** `{entry_price:.5f}`\n"
+                        f"🏁 **ราคาปิดแท่ง:** `{expiry_price:.5f}`"
                     )
                     send_telegram(msg)
             
-            time.sleep(30)
+            time.sleep(20)
         except Exception as e:
             print(f"Outcome checker error: {e}")
-            time.sleep(30)
+            time.sleep(20)
 
 # --- Thread 3: Telegram Polling Loop ---
 def telegram_polling_loop():
@@ -263,7 +292,7 @@ def telegram_polling_loop():
 
                     elif text in ["/help", "/start"]:
                         msg_help = (
-                            f"📌 *บอทพร้อมทำงาน!*\n"
+                            f"📌 *บอทพร้อมทำงาน (Bar-Close Synchronized)!*\n"
                             f"Chat ID: `{sender_chat_id}`\n\n"
                             f"• `/focus EUR/USD,GBP/USD` - เลือกคู่เงินที่ต้องการ\n"
                             f"• `/focus all` - เฝ้าทุกคู่เงิน\n"
@@ -278,7 +307,7 @@ def telegram_polling_loop():
             time.sleep(5)
 
 # --- Start Background Threads ---
-threading.Thread(target=trading_bot_loop, daemon=True).start()
+threading.Thread(target=synchronized_trading_loop, daemon=True).start()
 threading.Thread(target=outcome_checker_loop, daemon=True).start()
 threading.Thread(target=telegram_polling_loop, daemon=True).start()
 
