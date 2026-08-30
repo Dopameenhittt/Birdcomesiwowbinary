@@ -2,20 +2,16 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# ดึง URL จาก Environment Variable บน Render
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_connection():
-    """สร้างการเชื่อมต่อฐานข้อมูล Neon Postgres"""
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is not set!")
     return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    """สร้างตารางและ View อัตโนมัติเมื่อ Service เริ่มทำงาน"""
     conn = get_connection()
     with conn.cursor() as cur:
-        # ตาราง signals
         cur.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id SERIAL PRIMARY KEY,
@@ -29,18 +25,16 @@ def init_db():
             );
         """)
 
-        # ตาราง trade_results
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trade_results (
                 id SERIAL PRIMARY KEY,
-                signal_id INTEGER REFERENCES signals(id) ON DELETE CASCADE,
+                signal_id INTEGER REFERENCES signals(id) ON DELETE CASCADE UNIQUE,
                 expiry_price NUMERIC(12, 5) NOT NULL,
                 result VARCHAR(10) NOT NULL,
                 resolved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
-        # View สรุปสถิติ Win Rate รวม
         cur.execute("""
             CREATE OR REPLACE VIEW winrate_summary AS
             SELECT 
@@ -61,10 +55,8 @@ def init_db():
         """)
         conn.commit()
     conn.close()
-    print("Database tables initialized successfully.")
 
 def save_signal(pair: str, timeframe: str, direction: str, entry_price: float, confidence: float, reason: str) -> int:
-    """บันทึกสัญญาณเข้าเทรด และคืนค่า signal_id"""
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute("""
@@ -77,19 +69,32 @@ def save_signal(pair: str, timeframe: str, direction: str, entry_price: float, c
     conn.close()
     return signal_id
 
+def get_pending_signals():
+    """ดึงสัญญาณที่ยังไม่มีผลลัพธ์ในตาราง trade_results"""
+    conn = get_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT s.id, s.pair, s.timeframe, s.direction, s.entry_price, s.created_at
+            FROM signals s
+            LEFT JOIN trade_results r ON s.id = r.signal_id
+            WHERE r.id IS NULL;
+        """)
+        results = cur.fetchall()
+    conn.close()
+    return results
+
 def save_result(signal_id: int, expiry_price: float, result: str):
-    """บันทึกผลการเทรด (WIN / LOSS / DRAW)"""
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO trade_results (signal_id, expiry_price, result)
-            VALUES (%s, %s, %s);
+            VALUES (%s, %s, %s)
+            ON CONFLICT (signal_id) DO NOTHING;
         """, (signal_id, expiry_price, result))
         conn.commit()
     conn.close()
 
 def fetch_winrate():
-    """ดึงสถิติ Win Rate ล่าสุดไปแสดงใน Telegram"""
     conn = get_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM winrate_summary;")
