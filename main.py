@@ -6,7 +6,8 @@ import requests
 import pandas as pd
 import ta
 import yfinance as yf
-from fastapi import FastAPI
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse
 import uvicorn
 from groq import Groq
 import db
@@ -30,11 +31,141 @@ ALL_PAIRS = {
 }
 
 active_pairs = list(ALL_PAIRS.keys())
+TIMEFRAMES = ["5m", "15m"]
+
 app = FastAPI()
 
-@app.get("/")
-def health_check():
-    return {"status": "active", "service": "Binary AI Candle-Sync Bot 24/7"}
+# --- Web Dashboard UI (HTML/CSS) ---
+@app.get("/", response_class=HTMLResponse)
+def render_dashboard():
+    stats = db.fetch_winrate()
+    pending = db.get_pending_signals()
+    
+    # คำนวณสรุปสถิติรวมทั้งหมด
+    total_trades = sum(row.get('total_trades', 0) for row in stats)
+    total_wins = sum(row.get('wins', 0) for row in stats)
+    total_losses = sum(row.get('losses', 0) for row in stats)
+    overall_wr = round((total_wins / (total_wins + total_losses) * 100), 2) if (total_wins + total_losses) > 0 else 0.0
+
+    # สร้าง Checkboxes สำหรับคู่เงิน
+    pair_checkboxes = ""
+    for p in ALL_PAIRS.keys():
+        checked = "checked" if p in active_pairs else ""
+        pair_checkboxes += f"""
+        <label style="margin-right: 15px; display: inline-flex; align-items: center; cursor: pointer;">
+            <input type="checkbox" name="pairs" value="{p}" {checked} style="margin-right: 6px; width: 16px; height: 16px;"> {p}
+        </label>
+        """
+
+    # สร้างแถวตารางสถิติ
+    stats_rows = ""
+    for row in stats:
+        wr = row.get('win_rate_percentage') or 0
+        stats_rows += f"""
+        <tr>
+            <td style="padding: 10px; border-bottom: 1px solid #334155;"><b>{row['pair']}</b></td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155;">{row['timeframe']}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155;">{row['total_trades']}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155; color: #4ade80;">{row['wins']}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155; color: #f87171;">{row['losses']}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155; font-weight: bold;">{wr}%</td>
+        </tr>
+        """
+    if not stats_rows:
+        stats_rows = "<tr><td colspan='6' style='text-align: center; padding: 20px; color: #94a3b8;'>ยังไม่มีข้อมูลสถิติที่บันทึกผลแล้ว</td></tr>"
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="th">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Binary AI Control Center</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }}
+            .container {{ max-width: 1000px; margin: auto; }}
+            .card {{ background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; }}
+            .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }}
+            .stat-box {{ background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #334155; text-align: center; }}
+            .btn {{ background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
+            .btn:hover {{ background: #2563eb; }}
+            table {{ width: 100%; border-collapse: collapse; text-align: left; }}
+            th {{ background: #0f172a; padding: 12px; border-bottom: 2px solid #334155; color: #94a3b8; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>⚡ Binary AI Trading Control Center</h2>
+            
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div style="color: #94a3b8; font-size: 14px;">Win Rate รวม</div>
+                    <div style="font-size: 28px; font-weight: bold; color: {'#4ade80' if overall_wr >= 60 else '#f87171'};">{overall_wr}%</div>
+                </div>
+                <div class="stat-box">
+                    <div style="color: #94a3b8; font-size: 14px;">จำนวนไม้ทั้งหมด</div>
+                    <div style="font-size: 28px; font-weight: bold;">{total_trades}</div>
+                </div>
+                <div class="stat-box">
+                    <div style="color: #94a3b8; font-size: 14px;">ชนะ (WIN)</div>
+                    <div style="font-size: 28px; font-weight: bold; color: #4ade80;">{total_wins}</div>
+                </div>
+                <div class="stat-box">
+                    <div style="color: #94a3b8; font-size: 14px;">แพ้ (LOSS)</div>
+                    <div style="font-size: 28px; font-weight: bold; color: #f87171;">{total_losses}</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>🎯 ตั้งค่าโฟกัสคู่เงิน (Watchlist Selection)</h3>
+                <form action="/update-watchlist" method="post">
+                    <div style="margin: 15px 0;">
+                        {pair_checkboxes}
+                    </div>
+                    <button type="submit" class="btn">บันทึกการตั้งค่าคู่เงิน</button>
+                </form>
+            </div>
+
+            <div class="card">
+                <h3>📊 สถิติ Win Rate แยกตามคู่เงิน & Timeframe</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>คู่เงิน</th>
+                            <th>Timeframe</th>
+                            <th>เทรดทั้งหมด</th>
+                            <th>ชนะ (WIN)</th>
+                            <th>แพ้ (LOSS)</th>
+                            <th>Win Rate</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {stats_rows}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@app.post("/update-watchlist")
+def update_watchlist(pairs: list[str] = Form(default=[])):
+    global active_pairs
+    if pairs:
+        active_pairs = [p for p in pairs if p in ALL_PAIRS]
+    else:
+        active_pairs = list(ALL_PAIRS.keys())
+    
+    send_telegram(f"⚙️ *มีการอัปเดต Watchlist จากหน้า Web Dashboard*\nกำลังเฝ้า: `{', '.join(active_pairs)}`")
+    
+    return HTMLResponse(content="""
+        <script>
+            alert("บันทึกการตั้งค่า Watchlist เรียบร้อยแล้ว!");
+            window.location.href = "/";
+        </script>
+    """)
 
 # --- Telegram Helper Functions ---
 def send_telegram(text: str):
@@ -57,7 +188,7 @@ def send_telegram_direct(chat_id, text: str):
     except Exception as e:
         print(f"Telegram direct error: {e}")
 
-# --- Technical Analysis (ใช้แท่งเทียนที่ปิดสมบูรณ์แล้ว) ---
+# --- Technical Analysis & Groq AI ---
 def analyze_technical(df: pd.DataFrame):
     df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=14).rsi()
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
@@ -65,7 +196,6 @@ def analyze_technical(df: pd.DataFrame):
     df['bb_lower'] = bb.bollinger_lband()
     df['ema_50'] = ta.trend.EMAIndicator(df['Close'], window=50).ema_indicator()
     
-    # อ่านแท่งเทียนที่เพิ่งปิดตัวลง (Last Closed Candle)
     closed_candle = df.iloc[-1]
     prev_candle = df.iloc[-2]
     
@@ -79,14 +209,13 @@ def ask_groq_ai(pair: str, tf: str, closed_row, setup_type: str):
         return None
     prompt = f"""
     You are an elite Binary Options Price Action Specialist.
-    A candle has just CLOSED for Asset: {pair}, Timeframe: {tf}.
-    Detected Setup: Potential {setup_type} for NEXT candle.
+    Asset: {pair}, Timeframe: {tf}, Setup: Potential {setup_type} for NEXT candle.
     Closed Price: {closed_row['Close']}
     RSI(14): {closed_row['rsi']:.2f}, BB Upper: {closed_row['bb_upper']:.2f}, BB Lower: {closed_row['bb_lower']:.2f}, EMA 50: {closed_row['ema_50']:.2f}
 
-    Evaluate if the NEXT candle will continue the mean-reversion.
-    Respond ONLY in strict JSON:
-    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<short 1-sentence reasoning>"}}
+    Evaluate if the NEXT candle will continue mean-reversion.
+    Respond ONLY in JSON:
+    {{"signal": "{setup_type}", "confidence": <float 0-100>, "reason": "<short sentence>"}}
     """
     try:
         res = groq_client.chat.completions.create(
@@ -100,10 +229,8 @@ def ask_groq_ai(pair: str, tf: str, closed_row, setup_type: str):
         print(f"Groq API error: {e}")
         return None
 
-# --- ฟังก์ชันคำนวณเวลารอจนถึงรอบแท่งเทียนถัดไป (เช่น :00, :05, :10) ---
 def sleep_until_next_5m_candle():
     now = datetime.datetime.now(datetime.timezone.utc)
-    # หาเศษนาทีที่เหลือจนถึงรอบ 5 นาทีถัดไป
     minutes_to_next = 5 - (now.minute % 5)
     target_time = (now + datetime.timedelta(minutes=minutes_to_next)).replace(second=2, microsecond=0)
     sleep_seconds = (target_time - now).total_seconds()
@@ -111,7 +238,7 @@ def sleep_until_next_5m_candle():
         sleep_seconds += 300
     return sleep_seconds
 
-# --- Thread 1: Synchronized Market Scanner Loop ---
+# --- Background Threads ---
 def synchronized_trading_loop():
     time.sleep(5)
     db.init_db()
@@ -119,17 +246,15 @@ def synchronized_trading_loop():
     
     while True:
         try:
-            # 1. รอจนกว่าจะถึงวินาทีที่ 02 ของรอบ 5 นาทีถัดไป
             wait_time = sleep_until_next_5m_candle()
             time.sleep(wait_time)
             
             current_utc = datetime.datetime.now(datetime.timezone.utc)
             current_minute = current_utc.minute
             
-            # เลือกว่าจะเช็ค Timeframe ไหนบ้างในรอบนี้
             timeframes_to_check = ["5m"]
             if current_minute % 15 == 0:
-                timeframes_to_check.append("15m") # ถ้าเป็นนาที 00, 15, 30, 45 ให้ตรวจ 15m ด้วย
+                timeframes_to_check.append("15m")
 
             current_focus = [p for p in active_pairs if p in ALL_PAIRS]
             
@@ -155,7 +280,6 @@ def synchronized_trading_loop():
                             
                             sig_id = db.save_signal(name, tf, setup, entry_price, conf, reason)
                             
-                            # คำนวณเวลาหมดอายุที่แน่นอน
                             duration_mins = 5 if tf == "5m" else 15
                             expiry_time = (current_utc + datetime.timedelta(minutes=duration_mins)).strftime('%H:%M')
                             
@@ -178,7 +302,6 @@ def synchronized_trading_loop():
             print(f"Scanner error: {e}")
             time.sleep(10)
 
-# --- Thread 2: Outcome Checker Loop ---
 def outcome_checker_loop():
     time.sleep(15)
     while True:
@@ -229,7 +352,6 @@ def outcome_checker_loop():
             print(f"Outcome checker error: {e}")
             time.sleep(20)
 
-# --- Thread 3: Telegram Polling Loop ---
 def telegram_polling_loop():
     global active_pairs
     last_update_id = 0
@@ -292,8 +414,7 @@ def telegram_polling_loop():
 
                     elif text in ["/help", "/start"]:
                         msg_help = (
-                            f"📌 *บอทพร้อมทำงาน (Bar-Close Synchronized)!*\n"
-                            f"Chat ID: `{sender_chat_id}`\n\n"
+                            f"📌 *บอทพร้อมทำงาน!*\nChat ID: `{sender_chat_id}`\n\n"
                             f"• `/focus EUR/USD,GBP/USD` - เลือกคู่เงินที่ต้องการ\n"
                             f"• `/focus all` - เฝ้าทุกคู่เงิน\n"
                             f"• `/watchlist` - ดูคู่เงินที่กำลังเฝ้าอยู่\n"
@@ -305,6 +426,9 @@ def telegram_polling_loop():
             time.sleep(1)
         except Exception as e:
             time.sleep(5)
+
+# --- Dependency Check for Form Post ---
+# เพิ่ม python-multipart ใน requirements.txt เพื่อให้รับค่า Form ได้
 
 # --- Start Background Threads ---
 threading.Thread(target=synchronized_trading_loop, daemon=True).start()
