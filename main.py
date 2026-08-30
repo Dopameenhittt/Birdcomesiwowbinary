@@ -30,24 +30,25 @@ ALL_PAIRS = {
     "BTC/USD": "BTC-USD"
 }
 
-active_pairs = list(ALL_PAIRS.keys())
+# โหลดค่า Watchlist ล่าสุดจาก Neon Database
+db.init_db(list(ALL_PAIRS.keys()))
+active_pairs = db.get_saved_watchlist(list(ALL_PAIRS.keys()))
 TIMEFRAMES = ["5m", "15m"]
 
 app = FastAPI()
 
-# --- Web Dashboard UI (HTML/CSS) ---
+# --- Web Dashboard UI ---
 @app.get("/", response_class=HTMLResponse)
 def render_dashboard():
+    global active_pairs
+    active_pairs = db.get_saved_watchlist(list(ALL_PAIRS.keys()))
     stats = db.fetch_winrate()
-    pending = db.get_pending_signals()
     
-    # คำนวณสรุปสถิติรวมทั้งหมด
     total_trades = sum(row.get('total_trades', 0) for row in stats)
     total_wins = sum(row.get('wins', 0) for row in stats)
     total_losses = sum(row.get('losses', 0) for row in stats)
     overall_wr = round((total_wins / (total_wins + total_losses) * 100), 2) if (total_wins + total_losses) > 0 else 0.0
 
-    # สร้าง Checkboxes สำหรับคู่เงิน
     pair_checkboxes = ""
     for p in ALL_PAIRS.keys():
         checked = "checked" if p in active_pairs else ""
@@ -57,7 +58,6 @@ def render_dashboard():
         </label>
         """
 
-    # สร้างแถวตารางสถิติ
     stats_rows = ""
     for row in stats:
         wr = row.get('win_rate_percentage') or 0
@@ -96,7 +96,6 @@ def render_dashboard():
     <body>
         <div class="container">
             <h2>⚡ Binary AI Trading Control Center</h2>
-            
             <div class="stats-grid">
                 <div class="stat-box">
                     <div style="color: #94a3b8; font-size: 14px;">Win Rate รวม</div>
@@ -117,7 +116,7 @@ def render_dashboard():
             </div>
 
             <div class="card">
-                <h3>🎯 ตั้งค่าโฟกัสคู่เงิน (Watchlist Selection)</h3>
+                <h3>🎯 ตั้งค่าโฟกัสคู่เงิน (บันทึกลง Database อัตโนมัติ)</h3>
                 <form action="/update-watchlist" method="post">
                     <div style="margin: 15px 0;">
                         {pair_checkboxes}
@@ -158,11 +157,13 @@ def update_watchlist(pairs: list[str] = Form(default=[])):
     else:
         active_pairs = list(ALL_PAIRS.keys())
     
-    send_telegram(f"⚙️ *มีการอัปเดต Watchlist จากหน้า Web Dashboard*\nกำลังเฝ้า: `{', '.join(active_pairs)}`")
+    # บันทึกสถานะล่าสุดลง Neon Postgres
+    db.update_saved_watchlist(active_pairs)
+    send_telegram(f"⚙️ *มีการบันทึก Watchlist ใหม่ลง Database:*\n`{', '.join(active_pairs)}`")
     
     return HTMLResponse(content="""
         <script>
-            alert("บันทึกการตั้งค่า Watchlist เรียบร้อยแล้ว!");
+            alert("บันทึกการตั้งค่า Watchlist ลงฐานข้อมูลเรียบร้อยแล้ว!");
             window.location.href = "/";
         </script>
     """)
@@ -241,13 +242,16 @@ def sleep_until_next_5m_candle():
 # --- Background Threads ---
 def synchronized_trading_loop():
     time.sleep(5)
-    db.init_db()
-    send_telegram("🚀 *ระบบ Binary AI (Bar-Close Sync) เริ่มทำงานแล้ว (24/7)*")
+    send_telegram("🚀 *ระบบ Binary AI Scanner เริ่มทำงานแล้ว (24/7)*")
     
     while True:
         try:
             wait_time = sleep_until_next_5m_candle()
             time.sleep(wait_time)
+            
+            # โหลด Watchlist ล่าสุดจาก Neon เพื่อให้ซิงค์กับการกดเปลี่ยนบนเว็บทันที
+            current_watchlist = db.get_saved_watchlist(list(ALL_PAIRS.keys()))
+            current_focus = [p for p in current_watchlist if p in ALL_PAIRS]
             
             current_utc = datetime.datetime.now(datetime.timezone.utc)
             current_minute = current_utc.minute
@@ -256,8 +260,6 @@ def synchronized_trading_loop():
             if current_minute % 15 == 0:
                 timeframes_to_check.append("15m")
 
-            current_focus = [p for p in active_pairs if p in ALL_PAIRS]
-            
             for name in current_focus:
                 ticker = ALL_PAIRS[name]
                 for tf in timeframes_to_check:
@@ -288,8 +290,8 @@ def synchronized_trading_loop():
                                 f"{icon} *สัญญาณเข้าเทรดแท่งใหม่ ({setup})*\n"
                                 f"━━━━━━━━━━━━━━━\n"
                                 f"📊 **คู่เงิน:** `{name}`\n"
-                                f"⏱ **Timeframe:** `{tf}` (เข้าแท่งนี้ทันที)\n"
-                                f"🏁 **หมดเวลาที่:** `{expiry_time} UTC` (จบแท่ง)\n"
+                                f"⏱ **Timeframe:** `{tf}`\n"
+                                f"🏁 **หมดเวลาที่:** `{expiry_time} UTC`\n"
                                 f"💵 **ราคาเปิดแท่ง:** `{entry_price:.5f}`\n"
                                 f"🎯 **ความมั่นใจ:** `{conf}%`\n"
                                 f"💡 **เหตุผล:** {reason}\n"
@@ -378,20 +380,23 @@ def telegram_polling_loop():
                         parts = text.split(" ", 1)
                         if len(parts) < 2 or parts[1].strip().lower() == "all":
                             active_pairs = list(ALL_PAIRS.keys())
-                            send_telegram_direct(sender_chat_id, "✅ *ตั้งค่าโฟกัส:* เฝ้าดู **ทุกคู่เงิน**")
+                            db.update_saved_watchlist(active_pairs)
+                            send_telegram_direct(sender_chat_id, "✅ *ตั้งค่าโฟกัส:* เฝ้าดู **ทุกคู่เงิน** (บันทึกลง Database แล้ว)")
                         else:
                             selected = [p.strip().upper() for p in parts[1].split(",") if p.strip().upper() in ALL_PAIRS]
                             if selected:
                                 active_pairs = selected
+                                db.update_saved_watchlist(active_pairs)
                                 pairs_text = ", ".join(active_pairs)
-                                send_telegram_direct(sender_chat_id, f"🎯 *ตั้งค่าโฟกัสสำเร็จ!*\nกำลังเฝ้าเฉพาะ: `{pairs_text}`")
+                                send_telegram_direct(sender_chat_id, f"🎯 *ตั้งค่าโฟกัสสำเร็จ!*\nกำลังเฝ้าเฉพาะ: `{pairs_text}` (บันทึกลง Database แล้ว)")
                             else:
                                 send_telegram_direct(sender_chat_id, "⚠️ ไม่พบคู่เงินที่ระบุ กรุณาพิมพ์เช่น `/focus EUR/USD,GBP/USD`")
 
                     elif text == "/watchlist":
-                        current = ", ".join(active_pairs)
+                        saved = db.get_saved_watchlist(list(ALL_PAIRS.keys()))
+                        current = ", ".join(saved)
                         available = ", ".join(ALL_PAIRS.keys())
-                        send_telegram_direct(sender_chat_id, f"📋 *คู่เงินที่กำลังเฝ้าดู:*\n`{current}`\n\n🔹 *คู่เงินทั้งหมดที่มี:* `{available}`")
+                        send_telegram_direct(sender_chat_id, f"📋 *คู่เงินที่กำลังเฝ้าดู (จาก Database):*\n`{current}`\n\n🔹 *คู่เงินทั้งหมดที่มี:* `{available}`")
 
                     elif text == "/stat":
                         try:
@@ -426,9 +431,6 @@ def telegram_polling_loop():
             time.sleep(1)
         except Exception as e:
             time.sleep(5)
-
-# --- Dependency Check for Form Post ---
-# เพิ่ม python-multipart ใน requirements.txt เพื่อให้รับค่า Form ได้
 
 # --- Start Background Threads ---
 threading.Thread(target=synchronized_trading_loop, daemon=True).start()
