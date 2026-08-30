@@ -1,4 +1,5 @@
 import os
+import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -9,9 +10,13 @@ def get_connection():
         raise ValueError("DATABASE_URL environment variable is not set!")
     return psycopg2.connect(DATABASE_URL)
 
-def init_db():
+def init_db(default_pairs=None):
+    if default_pairs is None:
+        default_pairs = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "BTC/USD"]
+
     conn = get_connection()
     with conn.cursor() as cur:
+        # 1. ตาราง signals
         cur.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id SERIAL PRIMARY KEY,
@@ -25,6 +30,7 @@ def init_db():
             );
         """)
 
+        # 2. ตาราง trade_results
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trade_results (
                 id SERIAL PRIMARY KEY,
@@ -35,6 +41,23 @@ def init_db():
             );
         """)
 
+        # 3. ตาราง bot_settings สำหรับจำค่า Watchlist ถาวร
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key VARCHAR(50) PRIMARY KEY,
+                value JSONB NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # บันทึกค่าเริ่มต้นถ้ายังไม่มี
+        cur.execute("""
+            INSERT INTO bot_settings (key, value)
+            VALUES ('active_watchlist', %s)
+            ON CONFLICT (key) DO NOTHING;
+        """, (json.dumps(default_pairs),))
+
+        # 4. View สรุปสถิติ
         cur.execute("""
             CREATE OR REPLACE VIEW winrate_summary AS
             SELECT 
@@ -56,6 +79,33 @@ def init_db():
         conn.commit()
     conn.close()
 
+def get_saved_watchlist(default_pairs):
+    """ดึงรายชื่อคู่เงินที่บันทึกไว้ใน Neon"""
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_settings WHERE key = 'active_watchlist';")
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+        conn.close()
+    except Exception as e:
+        print(f"Error reading watchlist from DB: {e}")
+    return default_pairs
+
+def update_saved_watchlist(pairs_list):
+    """บันทึกรายชื่อคู่เงินชุดใหม่ลง Neon"""
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO bot_settings (key, value, updated_at)
+            VALUES ('active_watchlist', %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (key) 
+            DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP;
+        """, (json.dumps(pairs_list),))
+        conn.commit()
+    conn.close()
+
 def save_signal(pair: str, timeframe: str, direction: str, entry_price: float, confidence: float, reason: str) -> int:
     conn = get_connection()
     with conn.cursor() as cur:
@@ -70,7 +120,6 @@ def save_signal(pair: str, timeframe: str, direction: str, entry_price: float, c
     return signal_id
 
 def get_pending_signals():
-    """ดึงสัญญาณที่ยังไม่มีผลลัพธ์ในตาราง trade_results"""
     conn = get_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
