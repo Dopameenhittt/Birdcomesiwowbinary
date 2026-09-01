@@ -37,6 +37,35 @@ TIMEFRAMES = ["5m", "15m"]
 
 app = FastAPI()
 
+# --- 0. Safe yfinance Download (Retry + Backoff on Rate Limit) ---
+def safe_yf_download(ticker: str, period: str, interval: str, max_retries: int = 3):
+    """
+    ห่อ yf.download ด้วย retry + exponential backoff
+    เพื่อรับมือกับ Yahoo Finance rate limit (HTTP 429 / Too Many Requests)
+    แทนที่จะปล่อยให้ล้มเหลวทันทีหรือได้ข้อมูลว่างเปล่ากลับมา
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+            if df is not None and not df.empty:
+                return df
+            last_error = "empty dataframe"
+        except Exception as e:
+            last_error = str(e)
+            is_rate_limited = "429" in last_error or "Too Many Requests" in last_error or "rate" in last_error.lower()
+            if is_rate_limited:
+                print(f"yfinance rate-limited for {ticker} (attempt {attempt + 1}/{max_retries}): {last_error}")
+            else:
+                print(f"yfinance error for {ticker} (attempt {attempt + 1}/{max_retries}): {last_error}")
+
+        # รอก่อน retry แบบ exponential backoff (2s, 4s, 8s, ...)
+        if attempt < max_retries - 1:
+            time.sleep(2 ** (attempt + 1))
+
+    print(f"yfinance download failed for {ticker} after {max_retries} attempts: {last_error}")
+    return pd.DataFrame()
+
 # --- 1. ZigZag Calculation Engine ---
 def calculate_zigzag(df: pd.DataFrame, deviation_pct: float):
     threshold = deviation_pct / 100.0
@@ -148,7 +177,7 @@ def execute_backtest(pair: str, tf: str, days: int):
     if not ticker:
         return {"error": "ไม่พบคู่เงินนี้"}
     
-    df = yf.download(ticker, period=f"{days}d", interval=tf, progress=False)
+    df = safe_yf_download(ticker, period=f"{days}d", interval=tf)
     if df.empty or len(df) < 50:
         return {"error": f"ข้อมูลย้อนหลังมีไม่เพียงพอ (ได้มา {len(df)} แท่งเทียน)"}
     
@@ -582,7 +611,7 @@ def synchronized_trading_loop():
             for name in current_focus:
                 ticker = ALL_PAIRS[name]
                 for tf in timeframes_to_check:
-                    df = yf.download(ticker, period="5d", interval=tf, progress=False)
+                    df = safe_yf_download(ticker, period="5d", interval=tf)
                     if df.empty or len(df) < 50:
                         continue
                     if isinstance(df.columns, pd.MultiIndex):
@@ -639,7 +668,7 @@ def outcome_checker_loop():
                     if not ticker:
                         continue
                     
-                    df = yf.download(ticker, period="1d", interval="1m", progress=False)
+                    df = safe_yf_download(ticker, period="1d", interval="1m")
                     if df.empty:
                         continue
                     if isinstance(df.columns, pd.MultiIndex):
