@@ -17,6 +17,7 @@ import db
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -37,19 +38,83 @@ TIMEFRAMES = ["5m", "15m"]
 
 app = FastAPI()
 
-# --- 0. Safe yfinance Download (Retry + Backoff on Rate Limit) ---
-def safe_yf_download(ticker: str, period: str, interval: str, max_retries: int = 3):
+# --- 0. Multi-source Market Data (Yahoo Finance primary, Twelve Data / Binance fallback) ---
+TWELVEDATA_INTERVAL_MAP = {"1m": "1min", "5m": "5min", "15m": "15min"}
+BARS_PER_DAY = {"1m": 1440, "5m": 288, "15m": 96}  # ใช้คำนวณ outputsize/limit ของแหล่งสำรอง
+
+def fetch_from_twelvedata(pair_name: str, interval: str, period_days: int) -> pd.DataFrame:
+    """ดึงข้อมูลราคาสำรองจาก Twelve Data (สำหรับคู่เงิน forex เมื่อ Yahoo ใช้ไม่ได้)"""
+    if not TWELVE_DATA_API_KEY:
+        return pd.DataFrame()
+    td_interval = TWELVEDATA_INTERVAL_MAP.get(interval)
+    if not td_interval:
+        return pd.DataFrame()
+
+    outputsize = min(5000, max(50, period_days * BARS_PER_DAY.get(interval, 288)))
+    try:
+        res = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params={
+                "symbol": pair_name,
+                "interval": td_interval,
+                "outputsize": outputsize,
+                "apikey": TWELVE_DATA_API_KEY,
+            },
+            timeout=15,
+        ).json()
+
+        if res.get("status") != "ok" or "values" not in res:
+            print(f"Twelve Data error for {pair_name}: {res.get('message', res)}")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(res["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df = df.set_index("datetime").sort_index()
+        df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
+        for col in ["Open", "High", "Low", "Close"]:
+            df[col] = df[col].astype(float)
+        return df[["Open", "High", "Low", "Close"]]
+    except Exception as e:
+        print(f"Twelve Data fetch failed for {pair_name}: {e}")
+        return pd.DataFrame()
+
+def fetch_from_binance(interval: str, period_days: int) -> pd.DataFrame:
+    """ดึงข้อมูลราคาสำรองจาก Binance Public API (สำหรับ BTC/USD เมื่อ Yahoo ใช้ไม่ได้ — ไม่ต้องใช้ API key)"""
+    limit = min(1000, max(50, period_days * BARS_PER_DAY.get(interval, 288)))
+    try:
+        res = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": interval, "limit": limit},
+            timeout=15,
+        ).json()
+
+        if not isinstance(res, list) or not res:
+            print(f"Binance error: {res}")
+            return pd.DataFrame()
+
+        rows = [{
+            "datetime": pd.to_datetime(k[0], unit="ms", utc=True),
+            "Open": float(k[1]), "High": float(k[2]), "Low": float(k[3]), "Close": float(k[4]),
+        } for k in res]
+        return pd.DataFrame(rows).set_index("datetime").sort_index()
+    except Exception as e:
+        print(f"Binance fetch failed: {e}")
+        return pd.DataFrame()
+
+def safe_yf_download(pair_name: str, ticker: str, period: str, interval: str, max_retries: int = 3):
     """
-    ห่อ yf.download ด้วย retry + exponential backoff
-    เพื่อรับมือกับ Yahoo Finance rate limit (HTTP 429 / Too Many Requests)
-    แทนที่จะปล่อยให้ล้มเหลวทันทีหรือได้ข้อมูลว่างเปล่ากลับมา
+    ลองดึงจาก Yahoo Finance ก่อน (retry + exponential backoff เมื่อโดน rate limit)
+    ถ้ายังพังอยู่หลัง retry ครบ จะลองดึงจากแหล่งสำรองแทน:
+    - BTC/USD → Binance Public API
+    - คู่เงิน forex อื่นๆ → Twelve Data (ต้องตั้ง TWELVE_DATA_API_KEY ไว้)
+    คืนค่าเป็น (DataFrame, source_name) เพื่อให้ผู้เรียกรู้ว่าข้อมูลมาจากไหน
     """
     last_error = None
     for attempt in range(max_retries):
         try:
             df = yf.download(ticker, period=period, interval=interval, progress=False)
             if df is not None and not df.empty:
-                return df
+                return df, "yahoo"
             last_error = "empty dataframe"
         except Exception as e:
             last_error = str(e)
@@ -59,12 +124,29 @@ def safe_yf_download(ticker: str, period: str, interval: str, max_retries: int =
             else:
                 print(f"yfinance error for {ticker} (attempt {attempt + 1}/{max_retries}): {last_error}")
 
-        # รอก่อน retry แบบ exponential backoff (2s, 4s, 8s, ...)
         if attempt < max_retries - 1:
             time.sleep(2 ** (attempt + 1))
 
-    print(f"yfinance download failed for {ticker} after {max_retries} attempts: {last_error}")
-    return pd.DataFrame()
+    print(f"yfinance download failed for {ticker} after {max_retries} attempts: {last_error} — ลองแหล่งสำรอง")
+
+    try:
+        period_days = int(period.rstrip("d"))
+    except ValueError:
+        period_days = 5
+
+    if pair_name == "BTC/USD":
+        df_fallback = fetch_from_binance(interval, period_days)
+        if not df_fallback.empty:
+            print(f"ใช้ข้อมูลจาก Binance แทน Yahoo Finance สำหรับ {pair_name}")
+            return df_fallback, "binance"
+    else:
+        df_fallback = fetch_from_twelvedata(pair_name, interval, period_days)
+        if not df_fallback.empty:
+            print(f"ใช้ข้อมูลจาก Twelve Data แทน Yahoo Finance สำหรับ {pair_name}")
+            return df_fallback, "twelvedata"
+
+    print(f"แหล่งสำรองก็ดึงข้อมูลไม่ได้สำหรับ {pair_name}")
+    return pd.DataFrame(), None
 
 # --- 1. ZigZag Calculation Engine ---
 def calculate_zigzag(df: pd.DataFrame, deviation_pct: float):
@@ -177,12 +259,25 @@ def execute_backtest(pair: str, tf: str, days: int):
     if not ticker:
         return {"error": "ไม่พบคู่เงินนี้"}
     
-    df = safe_yf_download(ticker, period=f"{days}d", interval=tf)
+    df, source = safe_yf_download(pair, ticker, period=f"{days}d", interval=tf)
     if df.empty or len(df) < 50:
         return {"error": f"ข้อมูลย้อนหลังมีไม่เพียงพอ (ได้มา {len(df)} แท่งเทียน)"}
     
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+
+    # ถ้าใช้แหล่งสำรอง (ไม่ใช่ Yahoo) เช็คว่าข้อมูลที่ได้มาครบตามช่วงวันที่เลือกไหม
+    # เพราะแหล่งสำรองมี limit จำนวนแท่งต่อ request (เช่น Twelve Data สูงสุด 5000 แท่ง)
+    # อาจทำให้ได้ข้อมูลน้อยกว่าที่เลือกจริงแบบเงียบๆ ถ้าไม่เตือนไว้
+    data_warning = None
+    if source and source != "yahoo":
+        expected_bars = days * BARS_PER_DAY.get(tf, 288)
+        if len(df) < expected_bars * 0.5:
+            data_warning = (
+                f"⚠️ ใช้ข้อมูลสำรองจาก {'Binance' if source == 'binance' else 'Twelve Data'} "
+                f"เนื่องจาก Yahoo Finance ใช้งานไม่ได้ชั่วคราว — ได้ข้อมูลย้อนหลังไม่ครบ {days} วันตามที่เลือก "
+                f"(ได้ {len(df)} แท่งเทียน จากที่ควรได้ประมาณ {expected_bars} แท่ง) ผลลัพธ์ด้านล่างจึงคำนวณจากช่วงเวลาที่สั้นกว่าที่เลือกจริง"
+            )
 
     df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=10).rsi()
     pivots_fast = calculate_zigzag(df, deviation_pct=0.05)
@@ -279,7 +374,8 @@ def execute_backtest(pair: str, tf: str, days: int):
         "winrate": winrate,
         "max_win_streak": max_win_streak,
         "max_loss_streak": max_loss_streak,
-        "trade_logs": trade_logs
+        "trade_logs": trade_logs,
+        "data_warning": data_warning
     }
 
 # --- 4. Web Dashboard UI ---
@@ -443,6 +539,14 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
     
     wr_color = "#4ade80" if res['winrate'] >= 60 else "#f87171"
 
+    data_warning_html = ""
+    if res.get("data_warning"):
+        data_warning_html = f"""
+        <div class="card" style="border: 1px solid #f59e0b; background: #422006;">
+            ⚠️ {res['data_warning']}
+        </div>
+        """
+
     # สร้างแถบ Visual Pattern Badge
     pattern_badges = ""
     for log in res["trade_logs"]:
@@ -493,6 +597,8 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
                 <h2>📈 ผลการทดสอบ Backtest: {res['pair']} ({res['timeframe']})</h2>
                 <a href="/" class="btn">⬅️ กลับหน้าหลัก Dashboard</a>
             </div>
+
+            {data_warning_html}
 
             <div class="card">
                 <div class="grid">
@@ -592,7 +698,11 @@ def sleep_until_next_5m_candle():
 def synchronized_trading_loop():
     time.sleep(5)
     send_telegram("🚀 *ระบบ Binary ZigZag Confluence Engine เริ่มทำงานแล้ว (24/7)*")
-    
+
+    # ใช้ตัวแปรเหล่านี้กันการแจ้งเตือนซ้ำถี่ๆ (ส่งแค่ตอนเปลี่ยนสถานะ ไม่ส่งทุกรอบ)
+    watchlist_was_empty = False
+    data_failure_alerted = False
+
     while True:
         try:
             wait_time = sleep_until_next_5m_candle()
@@ -600,6 +710,15 @@ def synchronized_trading_loop():
             
             current_watchlist = db.get_saved_watchlist(list(ALL_PAIRS.keys()))
             current_focus = [p for p in current_watchlist if p in ALL_PAIRS]
+
+            # แจ้งเตือนถ้า watchlist ว่างเปล่า (ไม่มีคู่เงินไหนถูกเลือกให้เฝ้าดูเลย)
+            # เพื่อไม่ให้ระบบเงียบไปเฉยๆ โดยไม่มีใครรู้ว่าทำไมไม่มีสัญญาณเข้า
+            if not current_focus:
+                if not watchlist_was_empty:
+                    send_telegram("⚠️ *แจ้งเตือน:* ไม่มีคู่เงินใน Watchlist เลย ระบบจะไม่สแกนหาสัญญาณจนกว่าจะตั้งค่าคู่เงินใหม่ (พิมพ์ `/focus all` หรือเลือกในหน้าเว็บ)")
+                    watchlist_was_empty = True
+                continue
+            watchlist_was_empty = False
             
             current_utc = datetime.datetime.now(datetime.timezone.utc)
             current_minute = current_utc.minute
@@ -608,11 +727,16 @@ def synchronized_trading_loop():
             if current_minute % 15 == 0:
                 timeframes_to_check.append("15m")
 
+            attempted = 0
+            failed = 0
+
             for name in current_focus:
                 ticker = ALL_PAIRS[name]
                 for tf in timeframes_to_check:
-                    df = safe_yf_download(ticker, period="5d", interval=tf)
+                    attempted += 1
+                    df, _source = safe_yf_download(name, ticker, period="5d", interval=tf)
                     if df.empty or len(df) < 50:
+                        failed += 1
                         continue
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
@@ -647,6 +771,17 @@ def synchronized_trading_loop():
                                 f"🆔 `Ref ID: #{sig_id}`"
                             )
                             send_telegram(msg)
+
+            # แจ้งเตือนถ้าดึงข้อมูลราคาไม่ได้เลยสักคู่เดียวในรอบนี้
+            # (เช่น Yahoo Finance บล็อก IP หรือ rate-limit หนักจนดึงไม่ได้ต่อเนื่อง)
+            # ส่งแค่ครั้งเดียวตอนเริ่มพัง ไม่สแปมทุก 5 นาที และแจ้งซ้ำเมื่อกลับมาใช้ได้ปกติ
+            if attempted > 0 and failed == attempted:
+                if not data_failure_alerted:
+                    send_telegram("🔴 *แจ้งเตือน:* ดึงข้อมูลราคาจาก Yahoo Finance ไม่ได้เลยในรอบนี้ (อาจโดน rate-limit หรือบล็อก) ระบบจะลองใหม่ในรอบถัดไปอัตโนมัติ")
+                    data_failure_alerted = True
+            elif attempted > 0 and data_failure_alerted:
+                send_telegram("🟢 *อัปเดต:* ดึงข้อมูลราคาได้ปกติแล้ว")
+                data_failure_alerted = False
         except Exception as e:
             print(f"Scanner error: {e}")
             time.sleep(10)
@@ -668,7 +803,7 @@ def outcome_checker_loop():
                     if not ticker:
                         continue
                     
-                    df = safe_yf_download(ticker, period="1d", interval="1m")
+                    df, _source = safe_yf_download(sig["pair"], ticker, period="1d", interval="1m")
                     if df.empty:
                         continue
                     if isinstance(df.columns, pd.MultiIndex):
