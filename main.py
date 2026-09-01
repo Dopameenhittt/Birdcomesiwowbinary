@@ -687,12 +687,6 @@ def outcome_checker_loop():
         except Exception as e:
             print(f"Outcome checker error: {e}")
             time.sleep(20)
-                    )
-                    send_telegram(msg)
-            time.sleep(20)
-        except Exception as e:
-            print(f"Outcome checker error: {e}")
-            time.sleep(20)
 
 def telegram_polling_loop():
     global active_pairs
