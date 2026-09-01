@@ -644,8 +644,25 @@ def outcome_checker_loop():
                         continue
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
-                        
-                    expiry_price = float(df.iloc[-1]['Close'])
+
+                    # หาแท่งเทียนที่เวลาตรง (หรือใกล้ที่สุด) กับเวลาหมดอายุจริง
+                    # แทนการหยิบแท่งล่าสุดที่ดึงมาได้เสมอ ซึ่งอาจดีเลย์จากเวลาหมดอายุจริง
+                    candle_index = df.index
+                    if candle_index.tz is None:
+                        candle_index = candle_index.tz_localize("UTC")
+                    else:
+                        candle_index = candle_index.tz_convert("UTC")
+
+                    time_diffs = np.abs((candle_index - target_expiry).total_seconds())
+                    closest_pos = int(time_diffs.argmin())
+                    closest_diff_seconds = time_diffs[closest_pos]
+
+                    # ถ้าแท่งที่ใกล้ที่สุดยังห่างจากเวลาหมดอายุจริงเกิน 2 นาที
+                    # แปลว่าข้อมูลยังมาไม่ถึง (data lag) รอรอบถัดไปแทนที่จะตัดสินผลด้วยราคาผิดเวลา
+                    if closest_diff_seconds > 120:
+                        continue
+
+                    expiry_price = float(df.iloc[closest_pos]['Close'])
                     entry_price = float(sig['entry_price'])
                     
                     if sig['direction'] == "CALL":
@@ -664,6 +681,12 @@ def outcome_checker_loop():
                         f"🎯 **คำสั่ง:** `{sig['direction']}`\n"
                         f"💵 **ราคาเปิด:** `{entry_price:.5f}`\n"
                         f"🏁 **ราคาปิดแท่ง:** `{expiry_price:.5f}`"
+                    )
+                    send_telegram(msg)
+            time.sleep(20)
+        except Exception as e:
+            print(f"Outcome checker error: {e}")
+            time.sleep(20)
                     )
                     send_telegram(msg)
             time.sleep(20)
