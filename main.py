@@ -290,6 +290,12 @@ def execute_backtest(pair: str, tf: str, days: int):
     current_loss_streak = 0
     max_loss_streak = 0
 
+    # เก็บสถิติ "Win Rate แบบมีเงื่อนไข" — เทียบ Win Rate ของไม้ที่เข้าต่อจากไม้ที่แพ้/ชนะ
+    # กับ Win Rate โดยรวม เพื่อดูว่า pattern เดิมมีความสัมพันธ์กับผลไม้ก่อนหน้าจริงไหม
+    after_loss_wins, after_loss_losses = 0, 0
+    after_win_wins, after_win_losses = 0, 0
+    prev_result = None
+
     trade_count = 0
     for i in range(20, len(df) - 1):
         slow_win = pivots_slow[i-2 : i+1]
@@ -351,6 +357,21 @@ def execute_backtest(pair: str, tf: str, days: int):
                 current_win_streak = 0
                 current_loss_streak = 0
 
+            # นับ Win Rate แบบมีเงื่อนไข: ไม้นี้เข้าต่อจากไม้ที่แพ้ หรือต่อจากไม้ที่ชนะ
+            # (ข้าม DRAW ตอนพิจารณา prev_result เพราะไม่ใช่ผลแพ้/ชนะที่ชัดเจน)
+            if res in ("WIN", "LOSS"):
+                if prev_result == "LOSS":
+                    if res == "WIN":
+                        after_loss_wins += 1
+                    else:
+                        after_loss_losses += 1
+                elif prev_result == "WIN":
+                    if res == "WIN":
+                        after_win_wins += 1
+                    else:
+                        after_win_losses += 1
+                prev_result = res
+
             trade_logs.append({
                 "no": trade_count,
                 "time": entry_time,
@@ -362,6 +383,11 @@ def execute_backtest(pair: str, tf: str, days: int):
 
     total = wins + losses + draws
     winrate = round((wins / (wins + losses) * 100), 2) if (wins + losses) > 0 else 0.0
+
+    after_loss_total = after_loss_wins + after_loss_losses
+    after_loss_winrate = round((after_loss_wins / after_loss_total * 100), 2) if after_loss_total > 0 else None
+    after_win_total = after_win_wins + after_win_losses
+    after_win_winrate = round((after_win_wins / after_win_total * 100), 2) if after_win_total > 0 else None
 
     return {
         "pair": pair,
@@ -375,7 +401,11 @@ def execute_backtest(pair: str, tf: str, days: int):
         "max_win_streak": max_win_streak,
         "max_loss_streak": max_loss_streak,
         "trade_logs": trade_logs,
-        "data_warning": data_warning
+        "data_warning": data_warning,
+        "after_loss_winrate": after_loss_winrate,
+        "after_loss_total": after_loss_total,
+        "after_win_winrate": after_win_winrate,
+        "after_win_total": after_win_total
     }
 
 # --- 4. Web Dashboard UI ---
@@ -539,6 +569,19 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
     
     wr_color = "#4ade80" if res['winrate'] >= 60 else "#f87171"
 
+    after_loss_wr = res.get("after_loss_winrate")
+    after_loss_total = res.get("after_loss_total", 0)
+    after_win_wr = res.get("after_win_winrate")
+    after_win_total = res.get("after_win_total", 0)
+    baseline_wr = res['winrate']
+
+    after_loss_display = f"{after_loss_wr}%" if after_loss_wr is not None else "N/A"
+    after_win_display = f"{after_win_wr}%" if after_win_wr is not None else "N/A"
+    after_loss_color = "#94a3b8"
+    if after_loss_wr is not None:
+        diff = after_loss_wr - baseline_wr
+        after_loss_color = "#4ade80" if diff > 2 else ("#f87171" if diff < -2 else "#94a3b8")
+
     data_warning_html = ""
     if res.get("data_warning"):
         data_warning_html = f"""
@@ -628,6 +671,32 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
                 <div style="background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #334155; line-height: 2.2; word-wrap: break-word;">
                     {pattern_badges}
                 </div>
+            </div>
+
+            <div class="card">
+                <h3>🔁 Win Rate แบบมีเงื่อนไข (Conditional Win Rate)</h3>
+                <p style="color: #94a3b8; font-size: 14px; margin: 8px 0 15px 0;">
+                    เทียบ Win Rate ของไม้ที่เข้า "ต่อจากไม้ที่แพ้/ชนะ" กับ Win Rate โดยรวม
+                    เพื่อดูว่าเทรดไม้ถัดไปด้วย pattern เดิมหลังแพ้ มีโอกาสชนะสูงขึ้นจริงไหม
+                </p>
+                <div class="grid">
+                    <div class="stat-box">
+                        <div style="color: #94a3b8; font-size: 13px;">Win Rate โดยรวม (baseline)</div>
+                        <div style="font-size: 26px; font-weight: bold; color: {wr_color};">{baseline_wr}%</div>
+                    </div>
+                    <div class="stat-box">
+                        <div style="color: #94a3b8; font-size: 13px;">Win Rate ไม้ถัดจากไม้ที่ "แพ้" ({after_loss_total} ไม้)</div>
+                        <div style="font-size: 26px; font-weight: bold; color: {after_loss_color};">{after_loss_display}</div>
+                    </div>
+                    <div class="stat-box">
+                        <div style="color: #94a3b8; font-size: 13px;">Win Rate ไม้ถัดจากไม้ที่ "ชนะ" ({after_win_total} ไม้)</div>
+                        <div style="font-size: 26px; font-weight: bold; color: #94a3b8;">{after_win_display}</div>
+                    </div>
+                </div>
+                <p style="color: #64748b; font-size: 13px; margin-top: 15px;">
+                    หมายเหตุ: ถ้าตัวเลขทั้ง 3 ใกล้เคียงกัน แปลว่าผลของไม้ก่อนหน้าไม่มีผลต่อไม้ถัดไป (ระบบไม่มี "ความจำ")
+                    — ตัวเลขจากช่วงเวลาสั้นๆ อาจแกว่งได้มาก ควรดูจากจำนวนไม้ที่มากพอก่อนสรุป
+                </p>
             </div>
 
             <div class="card">
