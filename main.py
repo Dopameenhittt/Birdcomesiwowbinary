@@ -254,7 +254,7 @@ def ask_groq_ai_zigzag(pair: str, tf: str, closed_row, setup_type: str):
         return None
 
 # --- 3. Detailed Backtest Engine (Trade-by-Trade History) ---
-def execute_backtest(pair: str, tf: str, days: int):
+def execute_backtest(pair: str, tf: str, days: int, use_ai_confirm: bool = False):
     ticker = ALL_PAIRS.get(pair)
     if not ticker:
         return {"error": "ไม่พบคู่เงินนี้"}
@@ -297,6 +297,7 @@ def execute_backtest(pair: str, tf: str, days: int):
     prev_result = None
 
     trade_count = 0
+    ai_skipped_count = 0
     for i in range(20, len(df) - 1):
         slow_win = pivots_slow[i-2 : i+1]
         has_slow_b = -1 in slow_win
@@ -328,6 +329,14 @@ def execute_backtest(pair: str, tf: str, days: int):
         )
 
         signal = "CALL" if call_cond else ("PUT" if put_cond else None)
+
+        if signal and use_ai_confirm:
+            # จำลองเงื่อนไขเดียวกับ live เป๊ะ: ต้องผ่าน Groq AI confidence >= 70
+            # ไม่งั้นถือว่าไม่มีสัญญาณ (ข้ามไปเหมือนที่ live ทำจริง)
+            ai_res = ask_groq_ai_zigzag(pair, tf, closed, signal)
+            if not (ai_res and ai_res.get("confidence", 0) >= 70):
+                ai_skipped_count += 1
+                signal = None
 
         if signal:
             trade_count += 1
@@ -405,7 +414,9 @@ def execute_backtest(pair: str, tf: str, days: int):
         "after_loss_winrate": after_loss_winrate,
         "after_loss_total": after_loss_total,
         "after_win_winrate": after_win_winrate,
-        "after_win_total": after_win_total
+        "after_win_total": after_win_total,
+        "use_ai_confirm": use_ai_confirm,
+        "ai_skipped_count": ai_skipped_count
     }
 
 # --- 4. Web Dashboard UI ---
@@ -413,6 +424,11 @@ def execute_backtest(pair: str, tf: str, days: int):
 def render_dashboard():
     stats = db.fetch_winrate()
     saved_list = db.get_saved_watchlist(list(ALL_PAIRS.keys()))
+    try:
+        candidate_stats = db.fetch_candidate_winrate()
+    except Exception as e:
+        print(f"fetch_candidate_winrate error: {e}")
+        candidate_stats = []
     
     total_trades = sum(row.get('total_trades', 0) for row in stats)
     total_wins = sum(row.get('wins', 0) for row in stats)
@@ -445,6 +461,22 @@ def render_dashboard():
         """
     if not stats_rows:
         stats_rows = "<tr><td colspan='6' style='text-align: center; padding: 20px; color: #94a3b8;'>ยังไม่มีข้อมูลสถิติที่บันทึกผลแล้ว</td></tr>"
+
+    candidate_rows = ""
+    for row in candidate_stats:
+        wr = row.get('win_rate_percentage') or 0
+        label = "✅ Groq อนุมัติ (ยิงจริง)" if row['ai_approved'] else "🚫 Groq ปฏิเสธ (ไม่ได้ยิง)"
+        candidate_rows += f"""
+        <tr>
+            <td style="padding: 10px; border-bottom: 1px solid #334155;">{label}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155;">{row['total_trades']}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155; color: #4ade80;">{row['wins']}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155; color: #f87171;">{row['losses']}</td>
+            <td style="padding: 10px; border-bottom: 1px solid #334155; font-weight: bold;">{wr}%</td>
+        </tr>
+        """
+    if not candidate_rows:
+        candidate_rows = "<tr><td colspan='5' style='text-align: center; padding: 20px; color: #94a3b8;'>ยังไม่มีข้อมูลพอ (ต้องรอสะสมสัญญาณและผลลัพธ์ก่อน)</td></tr>"
 
     html_content = f"""
     <!DOCTYPE html>
@@ -513,6 +545,10 @@ def render_dashboard():
                             <option value="59">60 วันล่าสุด (2 เดือน)</option>
                         </select>
                     </div>
+                    <label style="display: inline-flex; align-items: center; cursor: pointer; margin-top: 18px;">
+                        <input type="checkbox" name="use_ai_confirm" value="true" style="margin-right: 6px; width: 16px; height: 16px;">
+                        จำลองแบบ live (Groq AI confirm ≥70%) — ช้ากว่าปกติ แต่เทียบกับสถิติ live ได้ตรง
+                    </label>
                     <div style="margin-top: 18px;">
                         <button type="submit" class="btn btn-green">🚀 เริ่มจำลอง Backtest ทันที</button>
                     </div>
@@ -549,6 +585,29 @@ def render_dashboard():
                     </tbody>
                 </table>
             </div>
+
+            <!-- กล่องเทียบ Groq อนุมัติ vs ปฏิเสธ -->
+            <div class="card">
+                <h3>🤖 Groq อนุมัติ vs ปฏิเสธ — ตัวกรองนี้ช่วยจริงหรือเปล่า</h3>
+                <p style="color: #94a3b8; font-size: 14px; margin-top: -5px;">
+                    เทียบ win rate ของไม้ที่ผ่าน ZigZag+RSI เหมือนกัน แต่ Groq ตัดสินต่างกัน —
+                    ถ้าแถว "อนุมัติ" ชนะสูงกว่า "ปฏิเสธ" ชัดเจน แปลว่า Groq filter ช่วยจริง
+                </p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>กลุ่ม</th>
+                            <th>เทรดทั้งหมด</th>
+                            <th>ชนะ (WIN)</th>
+                            <th>แพ้ (LOSS)</th>
+                            <th>Win Rate</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {candidate_rows}
+                    </tbody>
+                </table>
+            </div>
         </div>
     </body>
     </html>
@@ -557,8 +616,8 @@ def render_dashboard():
 
 # --- 5. Backtest Result View (With Table & Pattern Badges) ---
 @app.post("/run-backtest")
-def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form(...)):
-    res = execute_backtest(pair, tf, days)
+def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form(...), use_ai_confirm: bool = Form(False)):
+    res = execute_backtest(pair, tf, days, use_ai_confirm=use_ai_confirm)
     if "error" in res:
         return HTMLResponse(content=f"""
             <script>
@@ -581,6 +640,23 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
     if after_loss_wr is not None:
         diff = after_loss_wr - baseline_wr
         after_loss_color = "#4ade80" if diff > 2 else ("#f87171" if diff < -2 else "#94a3b8")
+
+    ai_confirm_html = ""
+    if res.get("use_ai_confirm"):
+        ai_confirm_html = f"""
+        <div class="card" style="border: 1px solid #3b82f6; background: #0c1e3d;">
+            🤖 โหมดนี้จำลองด้วย Groq AI confirm ≥70% เหมือน live จริงทุกขั้นตอน —
+            ข้ามสัญญาณที่ ZigZag+RSI เจอแต่ Groq ไม่ผ่านไป <b>{res.get('ai_skipped_count', 0)}</b> ครั้ง
+            (ตัวเลข Win Rate ด้านล่างนี้เทียบกับสถิติ live ได้ตรง ๆ)
+        </div>
+        """
+    else:
+        ai_confirm_html = """
+        <div class="card" style="border: 1px solid #64748b;">
+            ℹ️ โหมดนี้ยังไม่ผ่าน Groq AI (เงื่อนไข ZigZag+RSI ล้วนๆ) — เทียบกับสถิติ live ตรงๆ ไม่ได้
+            เพราะ live กรองด้วย Groq confidence ≥70% เพิ่มอีกชั้น ลองติ๊ก "จำลองแบบ live (Groq AI)" ด้านล่างแล้วรันใหม่
+        </div>
+        """
 
     data_warning_html = ""
     if res.get("data_warning"):
@@ -641,6 +717,7 @@ def handle_backtest(pair: str = Form(...), tf: str = Form(...), days: int = Form
                 <a href="/" class="btn">⬅️ กลับหน้าหลัก Dashboard</a>
             </div>
 
+            {ai_confirm_html}
             {data_warning_html}
 
             <div class="card">
@@ -815,11 +892,25 @@ def synchronized_trading_loop():
                     
                     if setup:
                         ai_res = ask_groq_ai_zigzag(name, tf, closed_candle, setup)
-                        if ai_res and ai_res.get("confidence", 0) >= 70:
-                            entry_price = float(closed_candle['Close'])
-                            conf = float(ai_res['confidence'])
-                            reason = ai_res.get('reason', '')
-                            
+                        candidate_entry_price = float(closed_candle['Close'])
+                        candidate_conf = float(ai_res['confidence']) if ai_res and 'confidence' in ai_res else None
+                        candidate_reason = ai_res.get('reason', '') if ai_res else 'Groq ไม่ตอบ/error'
+                        approved = bool(ai_res and ai_res.get("confidence", 0) >= 70)
+
+                        # บันทึกทุกสัญญาณที่ผ่านเงื่อนไข ZigZag+RSI ไว้เทียบสถิติภายหลัง
+                        # (ไม่ว่า Groq จะอนุมัติหรือไม่) — ตารางแยกต่างหาก ไม่กระทบ
+                        # logic การเทรดเงินจริงด้านล่างนี้เลย
+                        try:
+                            db.save_candidate(name, tf, setup, candidate_entry_price,
+                                               candidate_conf, approved, candidate_reason)
+                        except Exception as e:
+                            print(f"save_candidate error: {e}")
+
+                        if approved:
+                            entry_price = candidate_entry_price
+                            conf = candidate_conf
+                            reason = candidate_reason
+
                             sig_id = db.save_signal(name, tf, setup, entry_price, conf, reason)
                             
                             duration_mins = 5 if tf == "5m" else 15
@@ -895,14 +986,17 @@ def outcome_checker_loop():
                     if closest_diff_seconds > 120:
                         continue
 
-                    expiry_price = float(df.iloc[closest_pos]['Close'])
-                    entry_price = float(sig['entry_price'])
-                    
+                    # ปัดเศษให้ตำแหน่งทศนิยมเท่ากับที่ entry_price ถูกเก็บไว้ (NUMERIC(12,5))
+                    # ก่อนเทียบ ไม่งั้น float ที่ดึงมาสดๆ อาจมีเศษทศนิยมเกิน 5 ตำแหน่ง
+                    # ทำให้ราคาที่ "เท่ากันจริง" ถูกตัดสินเป็น WIN/LOSS แทนที่จะเป็น DRAW
+                    expiry_price = round(float(df.iloc[closest_pos]['Close']), 5)
+                    entry_price = round(float(sig['entry_price']), 5)
+
                     if sig['direction'] == "CALL":
                         result = "WIN" if expiry_price > entry_price else ("LOSS" if expiry_price < entry_price else "DRAW")
                     else:
                         result = "WIN" if expiry_price < entry_price else ("LOSS" if expiry_price > entry_price else "DRAW")
-                    
+
                     db.save_result(sig['id'], expiry_price, result)
                     
                     res_icon = "✅ WIN" if result == "WIN" else ("❌ LOSS" if result == "LOSS" else "⚪ DRAW")
@@ -919,6 +1013,62 @@ def outcome_checker_loop():
             time.sleep(20)
         except Exception as e:
             print(f"Outcome checker error: {e}")
+            time.sleep(20)
+
+def candidate_outcome_checker_loop():
+    """
+    เหมือน outcome_checker_loop เป๊ะ แต่ตัดสินผลให้ signal_candidates
+    (ไม้ทั้งหมดที่ผ่าน ZigZag+RSI ไม่ว่า Groq จะอนุมัติหรือไม่) แทน signals
+    เพื่อให้เทียบ win rate ของกลุ่ม "Groq อนุมัติ" กับ "Groq ปฏิเสธ" ได้จริง
+    โดยไม่ยุ่งกับ signals/trade_results ที่ AI-Iqoption-running ใช้เทรดเงินจริง
+    """
+    time.sleep(15)
+    while True:
+        try:
+            pending = db.get_pending_candidates()
+            now = datetime.datetime.now(datetime.timezone.utc)
+
+            for cand in pending:
+                duration_min = 5 if cand["timeframe"] == "5m" else 15
+                target_expiry = cand["created_at"].replace(tzinfo=datetime.timezone.utc) if cand["created_at"].tzinfo is None else cand["created_at"]
+                target_expiry += datetime.timedelta(minutes=duration_min)
+
+                if now >= target_expiry:
+                    ticker = ALL_PAIRS.get(cand["pair"])
+                    if not ticker:
+                        continue
+
+                    df, _source = safe_yf_download(cand["pair"], ticker, period="1d", interval="1m")
+                    if df.empty:
+                        continue
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+
+                    candle_index = df.index
+                    if candle_index.tz is None:
+                        candle_index = candle_index.tz_localize("UTC")
+                    else:
+                        candle_index = candle_index.tz_convert("UTC")
+
+                    time_diffs = np.abs((candle_index - target_expiry).total_seconds())
+                    closest_pos = int(time_diffs.argmin())
+                    closest_diff_seconds = time_diffs[closest_pos]
+
+                    if closest_diff_seconds > 120:
+                        continue
+
+                    expiry_price = round(float(df.iloc[closest_pos]['Close']), 5)
+                    entry_price = round(float(cand['entry_price']), 5)
+
+                    if cand['direction'] == "CALL":
+                        result = "WIN" if expiry_price > entry_price else ("LOSS" if expiry_price < entry_price else "DRAW")
+                    else:
+                        result = "WIN" if expiry_price < entry_price else ("LOSS" if expiry_price > entry_price else "DRAW")
+
+                    db.save_candidate_result(cand['id'], expiry_price, result)
+            time.sleep(20)
+        except Exception as e:
+            print(f"Candidate outcome checker error: {e}")
             time.sleep(20)
 
 def telegram_polling_loop():
@@ -994,6 +1144,7 @@ def telegram_polling_loop():
 # --- 8. Start Background Threads ---
 threading.Thread(target=synchronized_trading_loop, daemon=True).start()
 threading.Thread(target=outcome_checker_loop, daemon=True).start()
+threading.Thread(target=candidate_outcome_checker_loop, daemon=True).start()
 threading.Thread(target=telegram_polling_loop, daemon=True).start()
 
 if __name__ == "__main__":
