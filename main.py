@@ -196,23 +196,13 @@ def calculate_zigzag(df: pd.DataFrame, deviation_pct: float):
     return pivots
 
 # --- 2. Setup Analysis ---
-def _last_confirmed_pivot(pivots: np.ndarray) -> int:
-    """คืนประเภทของจุดกลับตัวล่าสุดที่ "ยืนยันแล้ว" (1=บน, -1=ล่าง, 0=ยังไม่มี)
-
-    เดิมโค้ดเช็คแค่ 2-3 แท่งท้ายอาเรย์ (ดู analyze_zigzag_setup เวอร์ชันก่อนหน้า) ซึ่งอิง
-    สมมติฐานว่า ZigZag จะยืนยันตัวเองไวๆ หลังจุดกลับตัวเกิดขึ้น — แต่วัดจากราคาจริงแล้วพบว่า
-    ไม่จริง: fast zigzag (0.05%) ใช้เวลายืนยันเฉลี่ย ~24 นาที (บางครั้งเป็นชั่วโมง) และ
-    slow zigzag (0.15%) ใช้เวลาเฉลี่ย ~3.5 ชม. (median ~2 ชม.) เช็คแค่ 2-3 แท่ง (~10-15 นาที)
-    จึงจับจุดกลับตัวที่ยืนยันช้ากว่านั้นพลาดไปเกือบหมด (slow พลาดไปกว่า 95%)
-
-    ฟังก์ชันนี้แก้โดยดู "โครงสร้างล่าสุดที่ยืนยันแล้ว" แทน ไม่จำกัดว่าต้องยืนยันในไม่กี่แท่ง
-    ที่ผ่านมา — ถือว่าแนวโน้มยังคงอยู่ (เช่น bottom ล่าสุด แปลว่ายังอยู่ในขาขึ้น) จนกว่าจะมี
-    จุดกลับตัวฝั่งตรงข้ามมายืนยันใหม่ ซึ่งเป็นตรรกะมาตรฐานของ ZigZag และคำนวณได้จากข้อมูล
-    ที่มีอยู่ ณ ตอนนั้นจริงๆ ไม่ต้องอาศัยข้อมูลอนาคตแต่อย่างใด
-    """
-    nz = pivots[pivots != 0]
-    return int(nz[-1]) if len(nz) else 0
-
+# 23 ก.ย.: เคยลองแก้เป็น "ดูโครงสร้างล่าสุดที่ยืนยันแล้ว ไม่จำกัดอายุ" (ดู git history)
+# เพื่อไม่ให้พลาดจุดกลับตัวที่ยืนยันช้า — แต่ข้อมูล live จริงหลัง deploy (12 ชม.) พบว่า
+# Groq อนุมัติแล้ว win rate เหลือแค่ 25% (แย่กว่าทอยเหรียญ, แย่กว่าตัวที่ Groq ปฏิเสธด้วยซ้ำ)
+# เพราะโครงสร้างที่ปล่อยให้ "ค้าง" ได้ไม่จำกัดเวลา ทำให้เข้าไม้กับเทรนด์ที่จริงๆ ใกล้ตาย/
+# กำลังจะกลับตัวจริงแล้ว (แค่ยังไม่ยืนยันเป็นทางการ) — ย้อนกลับมาใช้หน้าต่างแคบแบบเดิม
+# (เช็คแค่ 2-3 แท่งล่าสุด) เพราะมีหลักฐานจริงว่าทำงานดีกว่า ส่วนแนวคิด "ขยายแบบมีเพดาน"
+# ต้องเทสออฟไลน์ให้ชัวร์ก่อน ไม่ควรทดลองกับเงินจริงตรงๆ อีก
 def analyze_zigzag_setup(df: pd.DataFrame):
     df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=10).rsi()
     pivots_fast = calculate_zigzag(df, deviation_pct=0.05)
@@ -220,13 +210,12 @@ def analyze_zigzag_setup(df: pd.DataFrame):
 
     closed = df.iloc[-1]
 
-    last_slow = _last_confirmed_pivot(pivots_slow)
-    has_slow_bottom = (last_slow == -1)
-    has_slow_top = (last_slow == 1)
+    slow_window = pivots_slow[-3:]
+    has_slow_bottom = -1 in slow_window
+    has_slow_top = 1 in slow_window
 
-    last_fast = _last_confirmed_pivot(pivots_fast)
-    has_fast_bottom = (last_fast == -1)
-    has_fast_top = (last_fast == 1)
+    has_fast_bottom = (pivots_fast[-1] == -1 or pivots_fast[-2] == -1)
+    has_fast_top = (pivots_fast[-1] == 1 or pivots_fast[-2] == 1)
 
     total_range = closed['High'] - closed['Low']
     if total_range == 0:
